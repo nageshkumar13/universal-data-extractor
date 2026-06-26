@@ -3,9 +3,9 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.panel import Panel
 
 from core.config import ProfileLoader
+from core.http_client import HttpClient
 
 
 console = Console()
@@ -19,17 +19,12 @@ def main(profile: str) -> None:
 
     loader = ProfileLoader()
     loaded_profile = loader.load(Path(profile))
+    client = HttpClient()
+    html = client.fetch(loaded_profile["start_url"])
 
-    console.print(
-        Panel.fit(
-            f"[bold]Site:[/bold] {loaded_profile['site_name']}\n"
-            f"[bold]Engine:[/bold] {loaded_profile['engine']}\n"
-            f"[bold]Start URL:[/bold] {loaded_profile['start_url']}\n"
-            f"[bold]Fields:[/bold] {len(loaded_profile['fields'])}",
-            title="Profile Loaded",
-            border_style="green",
-        )
-    )
+    console.print("Fetched page successfully")
+    console.print(f"Status: {client.last_status_code}")
+    console.print(f"HTML size: {len(html)} characters")
 
 
 if __name__ == "__main__":
