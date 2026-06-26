@@ -25,7 +25,7 @@ def main(profile: str) -> None:
     html = client.fetch(loaded_profile["start_url"])
 
     parser = HTMLParser()
-    records = parser.extract(html, loaded_profile["fields"])
+    records = parser.extract(html, loaded_profile["fields"], loaded_profile["start_url"])
 
     console.print(f"Records extracted: {len(records)}")
     console.print("First record:")

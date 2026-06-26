@@ -1,9 +1,13 @@
 from bs4 import BeautifulSoup
 from bs4 import FeatureNotFound
 
+from core.url_utils import normalize_url
+
 
 class HTMLParser:
-    def extract(self, html: str, fields: dict[str, str]) -> list[dict[str, str]]:
+    def extract(
+        self, html: str, fields: dict[str, str], base_url: str
+    ) -> list[dict[str, str]]:
         soup = self._build_soup(html)
         record_selector = self._infer_record_selector(fields)
         records: list[dict[str, str]] = []
@@ -21,7 +25,7 @@ class HTMLParser:
                 elif extract_type == "text":
                     value = self._extract_text(target)
                 else:
-                    value = self._extract_attr(target, attribute_name)
+                    value = self._extract_attr(target, attribute_name, base_url)
 
                 record[field_name] = value
 
@@ -73,11 +77,19 @@ class HTMLParser:
     def _extract_text(self, element: object) -> str:
         return " ".join(element.get_text(" ", strip=True).split())
 
-    def _extract_attr(self, element: object, attribute_name: str | None) -> str:
+    def _extract_attr(
+        self, element: object, attribute_name: str | None, base_url: str
+    ) -> str:
         if not attribute_name:
             return ""
 
         value = element.get(attribute_name, "")
         if isinstance(value, list):
-            return " ".join(value)
-        return str(value).strip()
+            value = " ".join(value)
+        else:
+            value = str(value).strip()
+
+        if attribute_name in {"href", "src"} and value:
+            return normalize_url(value, base_url)
+
+        return value
