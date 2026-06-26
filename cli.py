@@ -6,6 +6,7 @@ from rich.console import Console
 
 from core.config import ProfileLoader
 from core.http_client import HttpClient
+from core.parser import HTMLParser
 
 
 console = Console()
@@ -19,12 +20,17 @@ def main(profile: str) -> None:
 
     loader = ProfileLoader()
     loaded_profile = loader.load(Path(profile))
+
     client = HttpClient()
     html = client.fetch(loaded_profile["start_url"])
 
-    console.print("Fetched page successfully")
-    console.print(f"Status: {client.last_status_code}")
-    console.print(f"HTML size: {len(html)} characters")
+    parser = HTMLParser()
+    records = parser.extract(html, loaded_profile["fields"])
+
+    console.print(f"Records extracted: {len(records)}")
+    console.print("First record:")
+    if records:
+        console.print(records[0])
 
 
 if __name__ == "__main__":
