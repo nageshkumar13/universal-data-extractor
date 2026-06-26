@@ -1,0 +1,19 @@
+site_name: Books to Scrape
+
+engine: static
+
+start_url: https://books.toscrape.com/catalogue/page-1.html
+
+max_pages: 5
+
+delay: 1.0
+
+fields:
+  title: "article.product_pod h3 a::attr(title)"
+  price: "article.product_pod p.price_color::text"
+  rating: "article.product_pod p.star-rating::attr(class)"
+  availability: "article.product_pod p.availability::text"
+  product_url: "article.product_pod h3 a::attr(href)"
+
+pagination:
+  next_button: "li.next a"
