@@ -44,4 +44,10 @@ class HttpClient:
             raise
 
         logger.info("Fetched URL successfully: %s", url)
-        return response.text
+
+        try:
+            return response.content.decode("utf-8")
+        except UnicodeDecodeError:
+            if response.apparent_encoding:
+                return response.content.decode(response.apparent_encoding, errors="replace")
+            return response.text

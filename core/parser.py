@@ -75,7 +75,8 @@ class HTMLParser:
         return selector
 
     def _extract_text(self, element: object) -> str:
-        return " ".join(element.get_text(" ", strip=True).split())
+        cleaned_text = " ".join(element.get_text(" ", strip=True).split())
+        return cleaned_text.replace("Â£", "£")
 
     def _extract_attr(
         self, element: object, attribute_name: str | None, base_url: str
