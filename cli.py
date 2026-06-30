@@ -10,6 +10,7 @@ from core.exporter import Exporter
 from core.http_client import HttpClient
 from core.pagination import Paginator
 from core.parser import HTMLParser
+from core.robots import RobotsChecker
 
 
 console = Console()
@@ -29,6 +30,7 @@ def main(profile: str, clear_cache: bool) -> None:
     parser = HTMLParser()
     paginator = Paginator()
     cache = URLCache()
+    robots = RobotsChecker(loaded_profile["start_url"])
 
     if clear_cache:
         cache.clear()
@@ -39,9 +41,16 @@ def main(profile: str, clear_cache: bool) -> None:
     processed_pages = 0
     pages_scraped = 0
     cached_skips = 0
+    robots_blocked = 0
     all_records: list[dict] = []
 
     while current_url and processed_pages < max_pages:
+        if not robots.is_allowed(current_url):
+            robots_blocked += 1
+            processed_pages += 1
+            current_url = None
+            continue
+
         if cache.is_cached(current_url):
             cached_skips += 1
             if next_selector:
@@ -77,6 +86,7 @@ def main(profile: str, clear_cache: bool) -> None:
     console.print(f"Pages scraped: {pages_scraped}")
     console.print(f"Records extracted: {len(all_records)}")
     console.print(f"Cached skips: {cached_skips}")
+    console.print(f"Robots blocked: {robots_blocked}")
     console.print(f"CSV: {csv_path.as_posix()}")
     console.print(f"JSON: {json_path.as_posix()}")
 
