@@ -11,6 +11,7 @@ from core.http_client import HttpClient
 from core.pagination import Paginator
 from core.parser import HTMLParser
 from core.robots import RobotsChecker
+from core.transformers import Transformer
 
 
 console = Console()
@@ -31,6 +32,7 @@ def main(profile: str, clear_cache: bool) -> None:
     paginator = Paginator()
     cache = URLCache()
     robots = RobotsChecker(loaded_profile["start_url"])
+    transformer = Transformer()
 
     if clear_cache:
         cache.clear()
@@ -75,16 +77,19 @@ def main(profile: str, clear_cache: bool) -> None:
         pages_scraped += 1
         processed_pages += 1
 
+    transformed_records = transformer.transform(all_records)
+
     exporter = Exporter()
     csv_path = Path("data/books.csv")
     json_path = Path("data/books.json")
 
-    if all_records or not csv_path.exists() or not json_path.exists():
-        csv_path = exporter.to_csv(all_records, csv_path)
-        json_path = exporter.to_json(all_records, json_path)
+    if transformed_records or not csv_path.exists() or not json_path.exists():
+        csv_path = exporter.to_csv(transformed_records, csv_path)
+        json_path = exporter.to_json(transformed_records, json_path)
 
     console.print(f"Pages scraped: {pages_scraped}")
     console.print(f"Records extracted: {len(all_records)}")
+    console.print(f"Records transformed: {len(transformed_records)}")
     console.print(f"Cached skips: {cached_skips}")
     console.print(f"Robots blocked: {robots_blocked}")
     console.print(f"CSV: {csv_path.as_posix()}")
