@@ -8,6 +8,7 @@ from rich.table import Table
 from core.config import ProfileLoader
 from core.exporter import Exporter
 from core.http_client import HttpClient
+from core.pagination import Paginator
 from core.parser import HTMLParser
 
 
@@ -24,21 +25,37 @@ def main(profile: str) -> None:
     loaded_profile = loader.load(Path(profile))
 
     client = HttpClient()
-    html = client.fetch(loaded_profile["start_url"])
-
     parser = HTMLParser()
-    records = parser.extract(html, loaded_profile["fields"], loaded_profile["start_url"])
+    paginator = Paginator()
+
+    current_url = loaded_profile["start_url"]
+    max_pages = loaded_profile.get("max_pages", 1)
+    next_selector = loaded_profile.get("pagination", {}).get("next_button", "")
+    page_count = 0
+    all_records: list[dict] = []
+
+    while current_url and page_count < max_pages:
+        html = client.fetch(current_url)
+        records = parser.extract(html, loaded_profile["fields"], current_url)
+        all_records.extend(records)
+
+        current_url = (
+            paginator.get_next_url(html, current_url, next_selector)
+            if next_selector
+            else None
+        )
+        page_count += 1
 
     exporter = Exporter()
-    csv_path = exporter.to_csv(records, Path("data/books.csv"))
-    json_path = exporter.to_json(records, Path("data/books.json"))
+    csv_path = exporter.to_csv(all_records, Path("data/books.csv"))
+    json_path = exporter.to_json(all_records, Path("data/books.json"))
 
     summary = Table(show_header=False)
-    summary.add_row("Records", str(len(records)))
+    summary.add_row("Records", str(len(all_records)))
     summary.add_row("CSV Export", "OK")
     summary.add_row("JSON Export", "OK")
 
-    console.print(f"Extracted {len(records)} records")
+    console.print(f"Records extracted: {len(all_records)}")
     console.print()
     console.print("Saved:")
     console.print(csv_path.as_posix())
