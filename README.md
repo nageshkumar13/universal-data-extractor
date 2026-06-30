@@ -22,6 +22,18 @@ The project is being developed incrementally, with each milestone adding new cap
 - robots.txt awareness
 - Compact CLI run summary
 
+## Sample Output
+
+```json
+{
+  "title": "A Light in the Attic",
+  "price": 51.77,
+  "rating": 3,
+  "availability": true,
+  "product_url": "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html"
+}
+```
+
 ## Planned Roadmap
 
 ### v1.0
