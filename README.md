@@ -1,4 +1,4 @@
-﻿# Universal Data Extractor
+# Universal Data Extractor
 
 A modular Python framework for extracting, cleaning, and exporting structured data from public websites.
 
@@ -9,6 +9,18 @@ A modular Python framework for extracting, cleaning, and exporting structured da
 Universal Data Extractor is a configurable Python framework designed to extract structured data from public websites using reusable extraction profiles.
 
 The project is being developed incrementally, with each milestone adding new capabilities while keeping the codebase clean, testable, and easy to extend.
+
+## Current Features
+
+- YAML-based extraction profiles
+- Static HTML fetching
+- CSS selector-based field extraction
+- Relative URL normalization
+- Pagination support
+- CSV and JSON export
+- SQLite URL cache
+- robots.txt awareness
+- Compact CLI run summary
 
 ## Planned Roadmap
 
