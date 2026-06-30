@@ -3,7 +3,6 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Table
 
 from core.config import ProfileLoader
 from core.exporter import Exporter
@@ -50,18 +49,10 @@ def main(profile: str) -> None:
     csv_path = exporter.to_csv(all_records, Path("data/books.csv"))
     json_path = exporter.to_json(all_records, Path("data/books.json"))
 
-    summary = Table(show_header=False)
-    summary.add_row("Records", str(len(all_records)))
-    summary.add_row("CSV Export", "OK")
-    summary.add_row("JSON Export", "OK")
-
+    console.print(f"Pages scraped: {page_count}")
     console.print(f"Records extracted: {len(all_records)}")
-    console.print()
-    console.print("Saved:")
-    console.print(csv_path.as_posix())
-    console.print(json_path.as_posix())
-    console.print()
-    console.print(summary)
+    console.print(f"CSV: {csv_path.as_posix()}")
+    console.print(f"JSON: {json_path.as_posix()}")
 
 
 if __name__ == "__main__":
