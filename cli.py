@@ -4,27 +4,10 @@ import click
 from dotenv import load_dotenv
 from rich.console import Console
 
-from core.cache import URLCache
-from core.config import ProfileLoader
-from core.exporter import Exporter
-from core.http_client import HttpClient
-from core.pagination import Paginator
-from core.parser import HTMLParser
-from core.robots import RobotsChecker
-from core.transformers import Transformer
+from core.runner import ScrapeRunner
 
 
 console = Console()
-
-
-def build_output_paths(site_name: str) -> tuple[Path, Path, Path]:
-    slug = "".join(character.lower() if character.isalnum() else " " for character in site_name)
-    slug = "_".join(slug.split())
-    return (
-        Path(f"data/{slug}.csv"),
-        Path(f"data/{slug}.json"),
-        Path(f"data/{slug}.xlsx"),
-    )
 
 
 @click.command()
@@ -34,77 +17,21 @@ def main(profile: str, clear_cache: bool) -> None:
     """Universal Data Extractor CLI."""
     load_dotenv()
 
-    loader = ProfileLoader()
-    loaded_profile = loader.load(Path(profile))
+    runner = ScrapeRunner()
+    summary = runner.run(
+        profile_path=Path(profile),
+        output_dir=Path("data"),
+        clear_cache=clear_cache,
+    )
 
-    client = HttpClient()
-    parser = HTMLParser()
-    paginator = Paginator()
-    cache = URLCache()
-    robots = RobotsChecker(loaded_profile["start_url"])
-    transformer = Transformer()
-
-    if clear_cache:
-        cache.clear()
-
-    current_url = loaded_profile["start_url"]
-    max_pages = loaded_profile.get("max_pages", 1)
-    next_selector = loaded_profile.get("pagination", {}).get("next_button", "")
-    processed_pages = 0
-    pages_scraped = 0
-    cached_skips = 0
-    robots_blocked = 0
-    all_records: list[dict] = []
-
-    while current_url and processed_pages < max_pages:
-        if not robots.is_allowed(current_url):
-            robots_blocked += 1
-            processed_pages += 1
-            current_url = None
-            continue
-
-        if cache.is_cached(current_url):
-            cached_skips += 1
-            if next_selector:
-                html = client.fetch(current_url)
-                current_url = paginator.get_next_url(html, current_url, next_selector)
-            else:
-                current_url = None
-
-            processed_pages += 1
-            continue
-
-        html = client.fetch(current_url)
-        records = parser.extract(html, loaded_profile["fields"], current_url)
-        all_records.extend(records)
-        cache.mark_done(current_url, len(records))
-
-        current_url = (
-            paginator.get_next_url(html, current_url, next_selector)
-            if next_selector
-            else None
-        )
-        pages_scraped += 1
-        processed_pages += 1
-
-    transformed_records = transformer.transform(all_records)
-
-    exporter = Exporter()
-    csv_path, json_path, xlsx_path = build_output_paths(loaded_profile["site_name"])
-
-    if transformed_records or not csv_path.exists() or not json_path.exists() or not xlsx_path.exists():
-        csv_path = exporter.to_csv(transformed_records, csv_path)
-        json_path = exporter.to_json(transformed_records, json_path)
-        xlsx_path = exporter.to_excel(transformed_records, xlsx_path)
-
-    console.print(f"Pages scraped: {pages_scraped}")
-    console.print(f"Records extracted: {len(all_records)}")
-    console.print(f"Records transformed: {len(transformed_records)}")
-    console.print(f"Cached skips: {cached_skips}")
-    console.print(f"Robots blocked: {robots_blocked}")
-    console.print(f"CSV: {csv_path.as_posix()}")
-    console.print(f"JSON: {json_path.as_posix()}")
-    console.print(f"XLSX: {xlsx_path.as_posix()}")
+    console.print(f"Pages scraped: {summary['pages_scraped']}")
+    console.print(f"Records extracted: {summary['records_extracted']}")
+    console.print(f"Records transformed: {summary['records_transformed']}")
+    console.print(f"Cached skips: {summary['cached_skips']}")
+    console.print(f"Robots blocked: {summary['robots_blocked']}")
+    console.print(f"CSV: {summary['csv_path'].as_posix()}")
+    console.print(f"JSON: {summary['json_path'].as_posix()}")
+    console.print(f"XLSX: {summary['xlsx_path'].as_posix()}")
 
 
 if __name__ == "__main__":
