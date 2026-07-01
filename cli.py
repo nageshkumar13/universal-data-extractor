@@ -29,6 +29,12 @@ def main(profile: str, clear_cache: bool) -> None:
     console.print(f"Records transformed: {summary['records_transformed']}")
     console.print(f"Cached skips: {summary['cached_skips']}")
     console.print(f"Robots blocked: {summary['robots_blocked']}")
+
+    if summary["cache_only_run"]:
+        console.print("No new records extracted. Existing cache skipped all pages.")
+        console.print("Use --clear-cache to regenerate outputs.")
+        return
+
     console.print(f"CSV: {summary['csv_path'].as_posix()}")
     console.print(f"JSON: {summary['json_path'].as_posix()}")
     console.print(f"XLSX: {summary['xlsx_path'].as_posix()}")
