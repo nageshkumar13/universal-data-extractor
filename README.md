@@ -2,7 +2,7 @@
 
 A modular Python framework for extracting, cleaning, and exporting structured data from public websites.
 
-> 🚧 Project Status: Under active development.
+> Project Status: Portfolio-ready for static extraction workflows.
 
 ## Vision
 
@@ -17,7 +17,7 @@ The project is being developed incrementally, with each milestone adding new cap
 - CSS selector-based field extraction
 - Relative URL normalization
 - Pagination support
-- CSV and JSON export
+- CSV, JSON, and Excel export
 - SQLite URL cache
 - robots.txt awareness
 - Compact CLI run summary
@@ -56,6 +56,8 @@ python cli.py --profile profiles/jobs.yaml --clear-cache
 | v0.5.0 | Multi-profile extraction support |
 | v0.6.0 | Business-friendly Excel exports |
 | v0.7.0 | Automated GitHub Actions test workflow |
+| v0.8.0 | Runner-based orchestration |
+| v0.8.1 | Static framework correctness fixes |
 
 ## Upcoming: Browser Engine
 
@@ -96,7 +98,7 @@ Planned scope:
 ### v2.0
 
 - Provider-agnostic AI extraction
-- CSS → XPath → LLM fallback architecture
+- CSS -> XPath -> LLM fallback architecture
 
 ## License
 
