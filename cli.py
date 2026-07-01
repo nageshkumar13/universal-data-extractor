@@ -17,10 +17,14 @@ from core.transformers import Transformer
 console = Console()
 
 
-def build_output_paths(site_name: str) -> tuple[Path, Path]:
+def build_output_paths(site_name: str) -> tuple[Path, Path, Path]:
     slug = "".join(character.lower() if character.isalnum() else " " for character in site_name)
     slug = "_".join(slug.split())
-    return Path(f"data/{slug}.csv"), Path(f"data/{slug}.json")
+    return (
+        Path(f"data/{slug}.csv"),
+        Path(f"data/{slug}.json"),
+        Path(f"data/{slug}.xlsx"),
+    )
 
 
 @click.command()
@@ -86,11 +90,12 @@ def main(profile: str, clear_cache: bool) -> None:
     transformed_records = transformer.transform(all_records)
 
     exporter = Exporter()
-    csv_path, json_path = build_output_paths(loaded_profile["site_name"])
+    csv_path, json_path, xlsx_path = build_output_paths(loaded_profile["site_name"])
 
-    if transformed_records or not csv_path.exists() or not json_path.exists():
+    if transformed_records or not csv_path.exists() or not json_path.exists() or not xlsx_path.exists():
         csv_path = exporter.to_csv(transformed_records, csv_path)
         json_path = exporter.to_json(transformed_records, json_path)
+        xlsx_path = exporter.to_excel(transformed_records, xlsx_path)
 
     console.print(f"Pages scraped: {pages_scraped}")
     console.print(f"Records extracted: {len(all_records)}")
@@ -99,6 +104,7 @@ def main(profile: str, clear_cache: bool) -> None:
     console.print(f"Robots blocked: {robots_blocked}")
     console.print(f"CSV: {csv_path.as_posix()}")
     console.print(f"JSON: {json_path.as_posix()}")
+    console.print(f"XLSX: {xlsx_path.as_posix()}")
 
 
 if __name__ == "__main__":
