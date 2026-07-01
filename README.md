@@ -46,6 +46,17 @@ The project is being developed incrementally, with each milestone adding new cap
 | v0.6.0 | Business-friendly Excel exports |
 | v0.7.0 | Automated GitHub Actions test workflow |
 
+## Upcoming: Browser Engine
+
+The next milestone will add a Playwright-based browser engine for JavaScript-rendered pages.
+
+Planned scope:
+- Async Playwright scraper
+- Support for `engine: browser`
+- `wait_for` selector in YAML profiles
+- Reuse existing parser, transformer, cache, robots checker, and exporters
+- No AI extraction yet
+
 ## Planned Roadmap
 
 ### v1.0
@@ -79,4 +90,5 @@ The project is being developed incrementally, with each milestone adding new cap
 ## License
 
 MIT
+
 
