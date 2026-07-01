@@ -22,6 +22,17 @@ The project is being developed incrementally, with each milestone adding new cap
 - robots.txt awareness
 - Compact CLI run summary
 
+## Current Architecture
+
+`CLI -> ScrapeRunner -> ProfileLoader -> HTTPClient -> Parser -> Transformer -> Exporter`
+
+## How to Run
+
+```bash
+python cli.py --profile profiles/books.yaml --clear-cache
+python cli.py --profile profiles/jobs.yaml --clear-cache
+```
+
 ## Sample Output
 
 ```json
@@ -90,5 +101,6 @@ Planned scope:
 ## License
 
 MIT
+
 
 
