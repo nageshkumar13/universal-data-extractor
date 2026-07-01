@@ -30,7 +30,13 @@ class Transformer:
         if value is None:
             return None
 
-        cleaned = str(value).strip().replace("Â£", "").replace("£", "")
+        cleaned = (
+            str(value)
+            .strip()
+            .replace("Ã‚Â£", "")
+            .replace("Â£", "")
+            .replace("£", "")
+        )
         if not cleaned:
             return None
 
