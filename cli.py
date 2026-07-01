@@ -17,6 +17,12 @@ from core.transformers import Transformer
 console = Console()
 
 
+def build_output_paths(site_name: str) -> tuple[Path, Path]:
+    slug = "".join(character.lower() if character.isalnum() else " " for character in site_name)
+    slug = "_".join(slug.split())
+    return Path(f"data/{slug}.csv"), Path(f"data/{slug}.json")
+
+
 @click.command()
 @click.option("--profile", "-p", required=True, help="Path to YAML extraction profile")
 @click.option("--clear-cache", is_flag=True, help="Clear cached URLs before running")
@@ -80,8 +86,7 @@ def main(profile: str, clear_cache: bool) -> None:
     transformed_records = transformer.transform(all_records)
 
     exporter = Exporter()
-    csv_path = Path("data/books.csv")
-    json_path = Path("data/books.json")
+    csv_path, json_path = build_output_paths(loaded_profile["site_name"])
 
     if transformed_records or not csv_path.exists() or not json_path.exists():
         csv_path = exporter.to_csv(transformed_records, csv_path)
