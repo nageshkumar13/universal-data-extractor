@@ -9,7 +9,7 @@ InvalidProfileError = ValueError
 
 class ProfileLoader:
     REQUIRED_KEYS = ("site_name", "engine", "start_url", "fields")
-    VALID_ENGINES = ("static", "browser")
+    VALID_ENGINES = ("static",)
 
     def load(self, path: str | Path) -> dict[str, Any]:
         profile_path = Path(path)
@@ -42,7 +42,7 @@ class ProfileLoader:
         engine = profile["engine"]
         if engine not in self.VALID_ENGINES:
             raise InvalidProfileError(
-                "Invalid engine.\n\nExpected:\nstatic\nbrowser\n\nReceived:\n"
+                "Invalid engine.\n\nExpected:\nstatic\n\nReceived:\n"
                 f"{engine}"
             )
 

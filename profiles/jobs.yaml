@@ -1,0 +1,16 @@
+site_name: Fake Jobs
+
+engine: static
+
+start_url: https://realpython.github.io/fake-jobs/
+
+max_pages: 1
+
+delay: 1.0
+
+fields:
+  title: "h2.title.is-5::text"
+  company: "h3.subtitle.is-6.company::text"
+  location: "p.location::text"
+  date_posted: "time::attr(datetime)"
+  apply_url: "a.card-footer-item::attr(href)"
