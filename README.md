@@ -34,6 +34,18 @@ The project is being developed incrementally, with each milestone adding new cap
 }
 ```
 
+## Release Milestones
+
+| Version | Focus |
+|---|---|
+| v0.1.0 | End-to-end static extraction pipeline |
+| v0.2.0 | SQLite cache and robots.txt awareness |
+| v0.3.0 | Structured data transformation layer |
+| v0.4.0 | Core unit test coverage |
+| v0.5.0 | Multi-profile extraction support |
+| v0.6.0 | Business-friendly Excel exports |
+| v0.7.0 | Automated GitHub Actions test workflow |
+
 ## Planned Roadmap
 
 ### v1.0
@@ -67,3 +79,4 @@ The project is being developed incrementally, with each milestone adding new cap
 ## License
 
 MIT
+
