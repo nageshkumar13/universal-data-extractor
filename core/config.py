@@ -9,7 +9,7 @@ InvalidProfileError = ValueError
 
 class ProfileLoader:
     REQUIRED_KEYS = ("site_name", "engine", "start_url", "fields")
-    VALID_ENGINES = ("static",)
+    VALID_ENGINES = ("static", "browser")
 
     def load(self, path: str | Path) -> dict[str, Any]:
         profile_path = Path(path)
@@ -42,8 +42,16 @@ class ProfileLoader:
         engine = profile["engine"]
         if engine not in self.VALID_ENGINES:
             raise InvalidProfileError(
-                "Invalid engine.\n\nExpected:\nstatic\n\nReceived:\n"
+                "Invalid engine.\n\nExpected one of:\nstatic\nbrowser\n\nReceived:\n"
                 f"{engine}"
+            )
+
+        wait_for = profile.get("wait_for")
+        if wait_for is not None and (
+            not isinstance(wait_for, str) or not wait_for.strip()
+        ):
+            raise InvalidProfileError(
+                "Invalid wait_for. Expected a non-empty CSS selector."
             )
 
         start_url = profile["start_url"]

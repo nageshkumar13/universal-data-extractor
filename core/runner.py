@@ -3,9 +3,9 @@ from typing import Any
 import time
 
 from core.cache import URLCache
+from core.client_factory import PageClient, create_client
 from core.config import ProfileLoader
 from core.exporter import Exporter
-from core.http_client import HttpClient
 from core.pagination import Paginator
 from core.parser import HTMLParser
 from core.robots import RobotsChecker
@@ -13,9 +13,9 @@ from core.transformers import Transformer
 
 
 class ScrapeRunner:
-    def __init__(self) -> None:
+    def __init__(self, client: PageClient | None = None) -> None:
         self.loader = ProfileLoader()
-        self.client = HttpClient()
+        self.client = client
         self.parser = HTMLParser()
         self.paginator = Paginator()
         self.cache = URLCache()
@@ -29,6 +29,7 @@ class ScrapeRunner:
         clear_cache: bool = False,
     ) -> dict[str, Any]:
         profile = self.loader.load(profile_path)
+        client = self.client or create_client(profile["engine"])
         robots = RobotsChecker(profile["start_url"])
 
         if clear_cache:
@@ -56,9 +57,11 @@ class ScrapeRunner:
                 cached_skips += 1
                 if next_selector:
                     html, request_count = self._fetch_page(
+                        client,
                         current_url,
                         delay,
                         request_count,
+                        profile.get("wait_for"),
                     )
                     current_url = self.paginator.get_next_url(html, current_url, next_selector)
                 else:
@@ -68,9 +71,11 @@ class ScrapeRunner:
                 continue
 
             html, request_count = self._fetch_page(
+                client,
                 current_url,
                 delay,
                 request_count,
+                profile.get("wait_for"),
             )
             records = self.parser.extract(html, profile["fields"], current_url)
             all_records.extend(records)
@@ -117,14 +122,16 @@ class ScrapeRunner:
 
     def _fetch_page(
         self,
+        client: PageClient,
         url: str,
         delay: float,
         request_count: int,
+        wait_for: str | None,
     ) -> tuple[str, int]:
         if request_count > 0 and delay > 0:
             time.sleep(delay)
 
-        html = self.client.fetch(url)
+        html = client.fetch(url, wait_for=wait_for)
         return html, request_count + 1
 
     def _build_output_paths(self, site_name: str, output_dir: Path) -> tuple[Path, Path, Path]:

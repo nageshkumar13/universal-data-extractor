@@ -32,7 +32,7 @@ class HttpClient:
         self.session.mount("https://", adapter)
         self.session.headers.update({"User-Agent": self.USER_AGENT})
 
-    def fetch(self, url: str) -> str:
+    def fetch(self, url: str, wait_for: str | None = None) -> str:
         logger.info("Fetching URL: %s", url)
 
         try:

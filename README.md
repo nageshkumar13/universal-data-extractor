@@ -2,7 +2,7 @@
 
 A modular Python framework for extracting, cleaning, and exporting structured data from public websites.
 
-> Project Status: Portfolio-ready for static extraction workflows.
+> Project Status: Static extraction is portfolio-ready; browser extraction is in development.
 
 ## Vision
 
@@ -14,6 +14,7 @@ The project is being developed incrementally, with each milestone adding new cap
 
 - YAML-based extraction profiles
 - Static HTML fetching
+- JavaScript-rendered HTML fetching with Playwright
 - CSS selector-based field extraction
 - Relative URL normalization
 - Pagination support
@@ -31,6 +32,13 @@ The project is being developed incrementally, with each milestone adding new cap
 ```bash
 python cli.py --profile profiles/books.yaml --clear-cache
 python cli.py --profile profiles/jobs.yaml --clear-cache
+```
+
+For browser profiles, install Chromium once and run the JavaScript example:
+
+```bash
+playwright install chromium
+python cli.py --profile profiles/quotes_js.yaml --clear-cache
 ```
 
 ## Sample Output
@@ -58,15 +66,15 @@ python cli.py --profile profiles/jobs.yaml --clear-cache
 | v0.7.0 | Automated GitHub Actions test workflow |
 | v0.8.0 | Runner-based orchestration |
 | v0.8.1 | Static framework correctness fixes |
+| Unreleased | Playwright browser engine foundation |
 
 ## Upcoming: Browser Engine
 
-The next milestone will add a Playwright-based browser engine for JavaScript-rendered pages.
+The next milestone is adding a Playwright-based browser engine for JavaScript-rendered pages.
 
 Planned scope:
-- Async Playwright scraper
-- Support for `engine: browser`
-- `wait_for` selector in YAML profiles
+- Browser lifecycle and performance improvements
+- Integration testing against a JavaScript-rendered page
 - Reuse existing parser, transformer, cache, robots checker, and exporters
 - No AI extraction yet
 
@@ -103,6 +111,5 @@ Planned scope:
 ## License
 
 MIT
-
 
 

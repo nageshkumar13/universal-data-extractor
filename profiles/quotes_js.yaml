@@ -1,0 +1,19 @@
+site_name: Quotes JavaScript
+
+engine: browser
+
+start_url: https://quotes.toscrape.com/js/
+
+wait_for: "div.quote"
+
+max_pages: 3
+
+delay: 1.0
+
+fields:
+  quote: "div.quote span.text::text"
+  author: "div.quote small.author::text"
+  author_url: "div.quote a::attr(href)"
+
+pagination:
+  next_button: "li.next a"

@@ -17,7 +17,7 @@ class FakeClient:
         self.html_by_url = html_by_url
         self.calls: list[str] = []
 
-    def fetch(self, url: str) -> str:
+    def fetch(self, url: str, wait_for: str | None = None) -> str:
         self.calls.append(url)
         return self.html_by_url[url]
 
