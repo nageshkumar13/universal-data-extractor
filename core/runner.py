@@ -29,7 +29,7 @@ class ScrapeRunner:
         clear_cache: bool = False,
     ) -> dict[str, Any]:
         profile = self.loader.load(profile_path)
-        client = self.client or create_client(profile["engine"])
+        client = self.client if self.client is not None else create_client(profile["engine"])
         robots = RobotsChecker(profile["start_url"])
 
         if clear_cache:
@@ -46,48 +46,50 @@ class ScrapeRunner:
         request_count = 0
         all_records: list[dict[str, Any]] = []
 
-        while current_url and processed_pages < max_pages:
-            if not robots.is_allowed(current_url):
-                robots_blocked += 1
-                processed_pages += 1
-                current_url = None
-                continue
-
-            if self.cache.is_cached(current_url):
-                cached_skips += 1
-                if next_selector:
-                    html, request_count = self._fetch_page(
-                        client,
-                        current_url,
-                        delay,
-                        request_count,
-                        profile.get("wait_for"),
-                    )
-                    current_url = self.paginator.get_next_url(html, current_url, next_selector)
-                else:
+        # The runner owns both factory-created and injected clients.
+        with client as client:
+            while current_url and processed_pages < max_pages:
+                if not robots.is_allowed(current_url):
+                    robots_blocked += 1
+                    processed_pages += 1
                     current_url = None
+                    continue
 
+                if self.cache.is_cached(current_url):
+                    cached_skips += 1
+                    if next_selector:
+                        html, request_count = self._fetch_page(
+                            client,
+                            current_url,
+                            delay,
+                            request_count,
+                            profile.get("wait_for"),
+                        )
+                        current_url = self.paginator.get_next_url(html, current_url, next_selector)
+                    else:
+                        current_url = None
+
+                    processed_pages += 1
+                    continue
+
+                html, request_count = self._fetch_page(
+                    client,
+                    current_url,
+                    delay,
+                    request_count,
+                    profile.get("wait_for"),
+                )
+                records = self.parser.extract(html, profile["fields"], current_url)
+                all_records.extend(records)
+                self.cache.mark_done(current_url, len(records))
+
+                current_url = (
+                    self.paginator.get_next_url(html, current_url, next_selector)
+                    if next_selector
+                    else None
+                )
+                pages_scraped += 1
                 processed_pages += 1
-                continue
-
-            html, request_count = self._fetch_page(
-                client,
-                current_url,
-                delay,
-                request_count,
-                profile.get("wait_for"),
-            )
-            records = self.parser.extract(html, profile["fields"], current_url)
-            all_records.extend(records)
-            self.cache.mark_done(current_url, len(records))
-
-            current_url = (
-                self.paginator.get_next_url(html, current_url, next_selector)
-                if next_selector
-                else None
-            )
-            pages_scraped += 1
-            processed_pages += 1
 
         transformed_records = self.transformer.transform(all_records)
         csv_path, json_path, xlsx_path = self._build_output_paths(

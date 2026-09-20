@@ -1,4 +1,6 @@
 import logging
+from types import TracebackType
+from typing import Self
 
 from requests import Session
 from requests.adapters import HTTPAdapter
@@ -31,6 +33,20 @@ class HttpClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         self.session.headers.update({"User-Agent": self.USER_AGENT})
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.session.close()
 
     def fetch(self, url: str, wait_for: str | None = None) -> str:
         logger.info("Fetching URL: %s", url)
