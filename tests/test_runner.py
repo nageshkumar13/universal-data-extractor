@@ -1994,3 +1994,248 @@ def test_http_failure_recovery_demonstration(make_status_runner, engine):
     assert final["records_extracted"] == 3
     assert len(completion_rows(runner.cache)) == 1
     print(f"{engine}: 3 successful fetches -> middle-page HTTP 429, all 5 old files unchanged, no completion -> 3-page rebuild completed")
+
+
+
+def test_runner_passes_record_selector_regression(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner()
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile.update(record_selector="article", fields={"title": "h2::text"})
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    for url in urls:
+        runner.client.html_by_url[url] = '<h2>Outside</h2>' + runner.client.html_by_url[url]
+    result = runner.run(path, output_dir)
+    assert json.loads(result["json_path"].read_text(encoding="utf-8")) == [
+        {"title": f"Item {number}"} for number in range(1, 4)
+    ]
+
+
+
+@pytest.mark.parametrize("selector", [None, False, 1, [], {}, "", "  "])
+def test_invalid_record_selector_fails_before_client_network_or_cache_work(tmp_path, monkeypatch, selector):
+    from core.config import InvalidProfileError, ProfileLoader
+
+    path = tmp_path / "invalid.yaml"
+    path.write_text(yaml.safe_dump({"site_name": "Invalid", "engine": "browser",
+                    "start_url": "https://example.com", "fields": {"title": "h2::text"},
+                    "record_selector": selector}), encoding="utf-8")
+    factory = Mock(side_effect=AssertionError("No client construction"))
+    robots = Mock(side_effect=AssertionError("No robots request"))
+    monkeypatch.setattr(runner_module, "create_client", factory)
+    monkeypatch.setattr(runner_module, "RobotsChecker", robots)
+    runner = ScrapeRunner.__new__(ScrapeRunner)
+    runner.loader = ProfileLoader()
+    runner.last_quality_result = object()
+    with pytest.raises(InvalidProfileError, match="Invalid record_selector"):
+        runner.run(path, tmp_path)
+    assert runner.last_quality_result is None
+    factory.assert_not_called()
+    robots.assert_not_called()
+
+
+@pytest.mark.parametrize("engine", ["static", "browser"])
+def test_record_selector_multi_page_pipeline_uses_one_expanded_snapshot(make_completion_runner, engine):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile.update(engine=engine, record_selector="article.card", fields={
+        "title": {"selector": "h2::text", "required": True},
+        "price": {"selector": "p::text", "type": "float"},
+    })
+    path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    raw = []
+    for i, url in enumerate(urls, 1):
+        runner.client.html_by_url[url] = (
+            '<aside><h2>Outside</h2><p>999</p></aside>'
+            + ''.join(f'<article class="card"><h2>{i}-{j}</h2><p>{i * 10 + j}.50</p></article>' for j in (1, 2))
+            + '<article class="card"></article>'
+            + (f'<a class="next" href="{urls[i]}">Next</a>' if i < 3 else '')
+        )
+        raw.extend([{"title": f"{i}-{j}", "price": f"{i * 10 + j}.50"} for j in (1, 2)])
+        raw.append({"title": "", "price": ""})
+    expected = [{"title": f"{i}-{j}", "price": i * 10 + j + .5} for i in (1, 2, 3) for j in (1, 2)]
+    expanded = runner.loader.load(path)
+    original_profile = deepcopy(expanded)
+    runner.loader.load = Mock(return_value=expanded)
+    parse = runner.parser.extract
+    parsed = []
+    events = []
+
+    def extract(html, fields, base_url, record_selector=None):
+        assert record_selector == expanded["record_selector"]
+        assert fields == {name: value["selector"] for name, value in expanded["fields"].items()}
+        assert fields is not expanded["fields"]
+        assert completion_rows(runner.cache) == []
+        result = parse(html, fields, base_url, record_selector)
+        parsed.extend(deepcopy(result))
+        events.append("parse")
+        return result
+
+    runner.parser.extract = Mock(side_effect=extract)
+    transform = runner.transformer.transform
+
+    def transform_all(records):
+        assert runner.client.closed
+        assert runner.client.calls == urls
+        assert records == raw
+        events.append("transform")
+        return transform(records)
+
+    runner.transformer.transform = Mock(side_effect=transform_all)
+    process = runner.quality_processor.process
+
+    def quality(records, profile):
+        assert profile is expanded
+        assert events[-1] == "transform"
+        assert records == transform(raw)
+        events.append("quality")
+        return process(records, profile)
+
+    runner.quality_processor.process = Mock(side_effect=quality)
+    for name in ("write_quality_artifacts", "to_csv", "to_json", "to_excel"):
+        original = getattr(runner.exporter, name)
+
+        def export(records, output_path, _name=name, _original=original):
+            assert completion_rows(runner.cache) == []
+            assert runner.last_quality_result is not None
+            if _name == "write_quality_artifacts":
+                assert records is runner.last_quality_result
+            else:
+                assert records == expected
+            events.append(_name)
+            return _original(records, output_path)
+
+        setattr(runner.exporter, name, Mock(side_effect=export))
+    result = runner.run(path, output_dir)
+    assert events == ["parse"] * 3 + ["transform", "quality", "write_quality_artifacts", "to_csv", "to_json", "to_excel"]
+    runner.loader.load.assert_called_once_with(path)
+    runner.transformer.transform.assert_called_once()
+    runner.quality_processor.process.assert_called_once()
+    assert expanded == original_profile
+    assert parsed == raw
+    assert result["pages_scraped"] == 3
+    assert result["records_extracted"] == result["records_transformed"] == 9
+    assert runner.last_quality_result.report.rejected == 3
+    assert runner.last_quality_result.report.exported == 6
+    assert json.loads(result["json_path"].read_text(encoding="utf-8")) == expected
+    assert len(completion_rows(runner.cache)) == 1
+
+
+@pytest.mark.parametrize("quality", [False, True])
+def test_record_selector_zero_matches_complete_and_identical_rerun_skips(make_completion_runner, quality):
+    runner, path, output_dir, urls = make_completion_runner(quality=quality)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["record_selector"] = ".absent"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    result = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert result["records_extracted"] == result["records_transformed"] == 0
+    files = expected_run_paths(result, quality)
+    assert all(file.is_file() and file.stat().st_size > 0 for file in files)
+    assert json.loads(result["json_path"].read_text(encoding="utf-8")) == []
+    if quality:
+        report = json.loads(result["csv_path"].with_suffix(".quality.json").read_text(encoding="utf-8"))
+        assert all(value == 0 for value in report.values())
+        assert json.loads(result["csv_path"].with_suffix(".rejected.json").read_text(encoding="utf-8")) == []
+    before = {file: (file.read_bytes(), file.stat().st_mtime_ns) for file in files}
+    database = (runner.cache.db_path.read_bytes(), runner.cache.db_path.stat().st_mtime_ns)
+    rows = completion_rows(runner.cache)
+    assert len(rows) == 1
+    runner.client = FakeClient({})
+    for method in ("write_quality_artifacts", "to_csv", "to_json", "to_excel"):
+        setattr(runner.exporter, method, Mock(side_effect=AssertionError("No writes on skip")))
+    skipped = runner.run(path, output_dir)
+    assert skipped["cache_only_run"] is True
+    assert runner.client.calls == []
+    assert runner.client.enter_count == 0
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == rows
+    assert (runner.cache.db_path.read_bytes(), runner.cache.db_path.stat().st_mtime_ns) == database
+    assert {file: (file.read_bytes(), file.stat().st_mtime_ns) for file in files} == before
+
+
+@pytest.mark.parametrize("failure", ["record", "field"])
+@pytest.mark.parametrize("recovery", [False, True])
+def test_invalid_css_preserves_outputs_and_requires_complete_rebuild(make_completion_runner, failure, recovery):
+    from soupsieve import SelectorSyntaxError
+
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["record_selector"] = "article"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    before = {}
+    if recovery:
+        first = runner.run(path, output_dir)
+        before = {file: file.read_bytes() for file in expected_run_paths(first, True)}
+        assert len(completion_rows(runner.cache)) == 1
+        runner.client = FakeClient(runner.client.html_by_url)
+    broken = deepcopy(profile)
+    if failure == "record":
+        broken["record_selector"] = "["
+    else:
+        broken["fields"]["title"] = "[::text"
+    path.write_text(yaml.safe_dump(broken), encoding="utf-8")
+    for target, methods in (
+        (runner.transformer, ("transform",)), (runner.quality_processor, ("process",)),
+        (runner.exporter, ("write_quality_artifacts", "to_csv", "to_json", "to_excel")),
+    ):
+        for name in methods:
+            setattr(target, name, Mock(wraps=getattr(target, name)))
+    with pytest.raises(SelectorSyntaxError):
+        runner.run(path, output_dir)
+    assert runner.client.calls == urls[:1]
+    assert runner.client.closed
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == []
+    assert {file: file.read_bytes() for file in output_dir.glob("*")} == before
+    runner.transformer.transform.assert_not_called()
+    runner.quality_processor.process.assert_not_called()
+    for name in ("write_quality_artifacts", "to_csv", "to_json", "to_excel"):
+        getattr(runner.exporter, name).assert_not_called()
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.client = FakeClient(runner.client.html_by_url)
+    rebuilt = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert rebuilt["records_extracted"] == 3
+    assert len(completion_rows(runner.cache)) == 1
+    rows = completion_rows(runner.cache)
+    rebuilt_bytes = {file: file.read_bytes() for file in expected_run_paths(rebuilt, True)}
+    runner.client = FakeClient({})
+    assert runner.run(path, output_dir)["cache_only_run"] is True
+    assert runner.client.calls == []
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == rows
+    assert {file: file.read_bytes() for file in rebuilt_bytes} == rebuilt_bytes
+
+
+def test_record_selector_alone_invalidates_completion_and_a_b_a_ownership(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["fields"] = {"title": "h2::text"}
+    for i, url in enumerate(urls, 1):
+        runner.client.html_by_url[url] = (
+            f'<article class="a"><h2>A{i}</h2></article><article class="b"><h2>B{i}</h2></article>'
+            + (f'<a class="next" href="{urls[i]}">Next</a>' if i < 3 else '')
+        )
+    identities = []
+    for index, selector in enumerate(("article.a", "article.b", "article.a")):
+        profile["record_selector"] = selector
+        path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+        if index:
+            runner.client = FakeClient(runner.client.html_by_url)
+        result = runner.run(path, output_dir)
+        assert runner.client.calls == urls
+        assert result["cache_only_run"] is False
+        letter = "B" if index == 1 else "A"
+        assert json.loads(result["json_path"].read_text(encoding="utf-8")) == [
+            {"title": f"{letter}{i}"} for i in (1, 2, 3)
+        ]
+        rows = completion_rows(runner.cache)
+        assert len(rows) == 1
+        identities.append(rows[0][:2])
+        runner.client = FakeClient(runner.client.html_by_url)
+        assert runner.run(path, output_dir)["cache_only_run"] is True
+        assert runner.client.calls == []
+        assert completion_rows(runner.cache) == rows
+    assert identities[0][0] == identities[1][0] == identities[2][0]
+    assert identities[0][1] != identities[1][1]
+    assert identities[0] == identities[2]

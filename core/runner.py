@@ -91,7 +91,13 @@ class ScrapeRunner:
                     request_count,
                     profile.get("wait_for"),
                 )
-                records = self.parser.extract(html, parser_fields, current_url)
+                if "record_selector" in profile:
+                    records = self.parser.extract(
+                        html, parser_fields, current_url,
+                        record_selector=profile["record_selector"],
+                    )
+                else:
+                    records = self.parser.extract(html, parser_fields, current_url)
                 all_records.extend(records)
 
                 current_url = (

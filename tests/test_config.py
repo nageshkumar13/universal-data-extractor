@@ -314,3 +314,39 @@ def test_invalid_profile_is_rejected_before_client_or_robots_creation(tmp_path, 
 
     factory.assert_not_called()
     robots.assert_not_called()
+
+
+
+def test_record_selector_omission_does_not_enable_mode(tmp_path, profile):
+    loaded = load_profile(tmp_path, profile)
+    assert "record_selector" not in loaded
+    assert loaded == profile
+
+
+@pytest.mark.parametrize("selector", ["article.card", "  article[data-name='two  words'] > div  ", "["])
+def test_record_selector_string_is_preserved_without_css_validation(tmp_path, profile, selector):
+    profile["record_selector"] = selector
+    assert load_profile(tmp_path, profile)["record_selector"] == selector
+
+
+@pytest.mark.parametrize("selector", [1, True, False, [], {}, None, "", " ", "\t\n"])
+def test_invalid_record_selector_rejected_on_load(tmp_path, profile, selector):
+    profile["record_selector"] = selector
+    with pytest.raises(InvalidProfileError, match="Invalid record_selector"):
+        load_profile(tmp_path, profile)
+
+
+
+def test_record_selector_validation_preserves_mapping_and_unknown_key_policy(profile, tmp_path):
+    profile.update(record_selector="  article.card  ", client_notes={"labels": ["unchanged"]})
+    before = deepcopy(profile)
+    ProfileLoader().validate(profile)
+    assert profile == before
+    assert load_profile(tmp_path, profile) == before
+
+
+@pytest.mark.parametrize("selector", [1.5, 0.0])
+def test_record_selector_rejects_noninteger_numbers(profile, tmp_path, selector):
+    profile["record_selector"] = selector
+    with pytest.raises(InvalidProfileError, match="Invalid record_selector"):
+        load_profile(tmp_path, profile)

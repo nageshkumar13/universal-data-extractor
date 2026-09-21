@@ -104,6 +104,13 @@ class ProfileLoader:
                 "Invalid wait_for. Expected a non-empty CSS selector."
             )
 
+        if "record_selector" in profile:
+            record_selector = profile["record_selector"]
+            if not isinstance(record_selector, str) or not record_selector.strip():
+                raise InvalidProfileError(
+                    "Invalid record_selector. Expected a non-empty CSS selector."
+                )
+
         start_url = profile["start_url"]
         if not isinstance(start_url, str) or not start_url.startswith(
             ("http://", "https://")
