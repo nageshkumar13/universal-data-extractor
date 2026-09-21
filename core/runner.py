@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any
 import time
 
-from core.cache import URLCache
+from core.cache import URLCache, run_identity
 from core.client_factory import PageClient, create_client
 from core.config import ProfileLoader
 from core.exporter import Exporter
@@ -40,11 +40,29 @@ class ScrapeRunner:
                 name: definition["selector"]
                 for name, definition in profile["fields"].items()
             }
-        client = self.client if self.client is not None else create_client(profile["engine"])
-        robots = RobotsChecker(profile["start_url"])
-
+        csv_path, json_path, xlsx_path = self._build_output_paths(profile["site_name"], output_dir)
+        expected_outputs = [csv_path, json_path, xlsx_path]
+        if quality_enabled:
+            expected_outputs.extend([
+                csv_path.with_suffix(".quality.json"), csv_path.with_suffix(".rejected.json"),
+            ])
+        output_key, fingerprint = run_identity(profile, csv_path)
         if clear_cache:
             self.cache.clear()
+        completed_pages = self.cache.completed_pages(output_key, fingerprint)
+        if completed_pages is not None and self._outputs_complete(expected_outputs):
+            return {
+                "site_name": profile["site_name"], "pages_scraped": 0,
+                "records_extracted": 0, "records_transformed": 0,
+                "cached_skips": completed_pages, "robots_blocked": 0, "cache_only_run": True,
+                "csv_path": csv_path, "json_path": json_path, "xlsx_path": xlsx_path,
+            }
+
+        # Invalidate this destination even when its previous fingerprint differs.
+        # A failed rebuild must never leave an older profile's marker usable.
+        self.cache.invalidate_run(output_key)
+        client = self.client if self.client is not None else create_client(profile["engine"])
+        robots = RobotsChecker(profile["start_url"])
 
         current_url = profile["start_url"]
         max_pages = profile.get("max_pages", 1)
@@ -66,23 +84,6 @@ class ScrapeRunner:
                     current_url = None
                     continue
 
-                if self.cache.is_cached(current_url):
-                    cached_skips += 1
-                    if next_selector:
-                        html, request_count = self._fetch_page(
-                            client,
-                            current_url,
-                            delay,
-                            request_count,
-                            profile.get("wait_for"),
-                        )
-                        current_url = self.paginator.get_next_url(html, current_url, next_selector)
-                    else:
-                        current_url = None
-
-                    processed_pages += 1
-                    continue
-
                 html, request_count = self._fetch_page(
                     client,
                     current_url,
@@ -92,7 +93,6 @@ class ScrapeRunner:
                 )
                 records = self.parser.extract(html, parser_fields, current_url)
                 all_records.extend(records)
-                self.cache.mark_done(current_url, len(records))
 
                 current_url = (
                     self.paginator.get_next_url(html, current_url, next_selector)
@@ -109,25 +109,18 @@ class ScrapeRunner:
                 transformed_records, profile,
             )
             export_records = self.last_quality_result.clean_records
-        csv_path, json_path, xlsx_path = self._build_output_paths(
-            profile["site_name"],
-            output_dir,
-        )
-        cache_only_run = pages_scraped == 0 and cached_skips > 0 and not transformed_records
-
-        if self.last_quality_result is not None and not cache_only_run:
+        if self.last_quality_result is not None:
             self.exporter.write_quality_artifacts(self.last_quality_result, csv_path)
 
-        if transformed_records:
-            csv_path = self.exporter.to_csv(export_records, csv_path)
-            json_path = self.exporter.to_json(export_records, json_path)
-            xlsx_path = self.exporter.to_excel(export_records, xlsx_path)
-        elif not cache_only_run and (
-            not csv_path.exists() or not json_path.exists() or not xlsx_path.exists()
-        ):
-            csv_path = self.exporter.to_csv(export_records, csv_path)
-            json_path = self.exporter.to_json(export_records, json_path)
-            xlsx_path = self.exporter.to_excel(export_records, xlsx_path)
+        csv_path = self.exporter.to_csv(export_records, csv_path)
+        json_path = self.exporter.to_json(export_records, json_path)
+        xlsx_path = self.exporter.to_excel(export_records, xlsx_path)
+
+        if not self._outputs_complete(expected_outputs):
+            raise RuntimeError("Required output files are missing or empty after export.")
+        if not robots_blocked:
+            # The last state-changing action, after every required output succeeds.
+            self.cache.mark_complete(output_key, fingerprint, pages_scraped)
 
         return {
             "site_name": profile["site_name"],
@@ -136,11 +129,15 @@ class ScrapeRunner:
             "records_transformed": len(transformed_records),
             "cached_skips": cached_skips,
             "robots_blocked": robots_blocked,
-            "cache_only_run": cache_only_run,
+            "cache_only_run": False,
             "csv_path": csv_path,
             "json_path": json_path,
             "xlsx_path": xlsx_path,
         }
+
+    @staticmethod
+    def _outputs_complete(paths: list[Path]) -> bool:
+        return all(path.is_file() and path.stat().st_size > 0 for path in paths)
 
     def _fetch_page(
         self,

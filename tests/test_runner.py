@@ -70,6 +70,8 @@ class FakeCache:
         self.cached_urls = set(cached_urls or set())
         self.marked: list[tuple[str, int]] = []
         self.cleared = False
+        self.completions = {}
+        self.completed = []
 
     def is_cached(self, url: str) -> bool:
         return url in self.cached_urls
@@ -80,6 +82,23 @@ class FakeCache:
 
     def clear(self) -> None:
         self.cached_urls.clear()
+        self.completions.clear()
+        self.cleared = True
+
+
+    def completed_pages(self, output_key, fingerprint):
+        entry = self.completions.get(output_key)
+        return entry[1] if entry is not None and entry[0] == fingerprint else None
+
+    def invalidate_run(self, output_key):
+        self.completions.pop(output_key, None)
+
+    def mark_complete(self, output_key, fingerprint, pages_scraped):
+        self.completions[output_key] = (fingerprint, pages_scraped)
+        self.completed.append((output_key, fingerprint, pages_scraped))
+
+    def clear_runs(self):
+        self.completions.clear()
         self.cleared = True
 
 
@@ -122,40 +141,22 @@ class AllowAllRobots:
         return True
 
 
-def test_runner_does_not_export_empty_files_when_all_pages_are_cached(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    profile = {
-        "site_name": "Cached Example",
-        "engine": "static",
-        "start_url": "https://example.com/page-1.html",
-        "fields": {"title": "article h2::text"},
-        "max_pages": 1,
-        "delay": 0,
-    }
-
-    runner = ScrapeRunner()
-    runner.loader = FakeLoader(profile)
+def test_completed_run_preserves_outputs_without_opening_client(tmp_path, make_quality_runner):
+    runner, path = make_quality_runner(quality=False)
+    first = runner.run(path, tmp_path)
+    before = {key: first[key].read_bytes() for key in ("csv_path", "json_path", "xlsx_path")}
     runner.client = FakeClient({})
-    runner.parser = FakeParser({})
-    runner.paginator = FakePaginator({})
-    runner.cache = FakeCache({profile["start_url"]})
-    runner.transformer = FakeTransformer()
-    runner.exporter = FakeExporter()
-    monkeypatch.setattr(runner_module, "RobotsChecker", AllowAllRobots)
+    runner.exporter.calls.clear()
 
-    summary = runner.run(Path("profiles/example.yaml"), tmp_path)
+    summary = runner.run(path, tmp_path)
 
     assert summary["cache_only_run"] is True
     assert summary["pages_scraped"] == 0
     assert summary["cached_skips"] == 1
-    assert runner.client.enter_count == runner.client.exit_count == 1
-    assert runner.client.closed is True
+    assert runner.client.enter_count == runner.client.exit_count == 0
+    assert runner.client.calls == []
     assert runner.exporter.calls == []
-    assert summary["csv_path"].exists() is False
-    assert summary["json_path"].exists() is False
-    assert summary["xlsx_path"].exists() is False
+    assert {key: summary[key].read_bytes() for key in before} == before
 
 
 def test_runner_respects_profile_delay_between_requests(tmp_path, monkeypatch) -> None:
@@ -234,7 +235,9 @@ def test_runner_respects_profile_delay_between_requests(tmp_path, monkeypatch) -
     assert stages == ["transform", "to_csv", "to_json", "to_excel"]
     assert summary["records_extracted"] == summary["records_transformed"] == 2
     assert summary["cached_skips"] == summary["robots_blocked"] == 0
-    assert runner.cache.marked == [(page_one, 1), (page_two, 1)]
+    assert runner.cache.marked == []
+    assert len(runner.cache.completed) == 1
+    assert runner.cache.completed[0][2] == 2
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
@@ -438,7 +441,9 @@ def test_quality_runs_once_after_transform_across_pages_before_all_exports(
     assert summary["pages_scraped"] == 2
     assert summary["cached_skips"] == summary["robots_blocked"] == 0
     assert runner.client.calls == [page_one, page_two]
-    assert runner.cache.marked == [(page_one, 2), (page_two, 2)]
+    assert runner.cache.marked == []
+    assert len(runner.cache.completed) == 1
+    assert runner.cache.completed[0][2] == 2
     assert runner.client.enter_count == runner.client.exit_count == 1
     assert expected_profile == original_profile
     assert parser_batches == original_batches
@@ -571,23 +576,18 @@ def test_later_legacy_run_clears_previous_quality_result(tmp_path, make_quality_
     assert summary["records_transformed"] == 1
 
 
-def test_quality_cache_only_run_preserves_existing_skip_behavior(tmp_path, make_quality_runner):
+def test_completed_quality_rerun_skips_processing_and_resets_result(tmp_path, make_quality_runner):
     runner, path = make_quality_runner()
     runner.run(path, tmp_path)
-    previous_result = runner.last_quality_result
+    assert runner.last_quality_result is not None
     runner.client = FakeClient({})
     runner.exporter.calls.clear()
-    profile = runner.loader.load(path)
-    profile.pop("pagination")
-    runner.loader = FakeLoader(profile)
     runner.quality_processor.process = Mock(wraps=runner.quality_processor.process)
 
     summary = runner.run(path, tmp_path)
 
-    runner.quality_processor.process.assert_called_once_with([], profile)
-    assert runner.last_quality_result is not previous_result
-    assert runner.last_quality_result.report.extracted == 0
-    assert runner.last_quality_result.clean_records == []
+    runner.quality_processor.process.assert_not_called()
+    assert runner.last_quality_result is None
     assert runner.exporter.calls == []
     assert runner.client.calls == []
     assert summary["cache_only_run"] is True
@@ -637,14 +637,10 @@ def test_zero_extracted_records_produce_zero_quality_result_and_preserve_export_
     assert summary["pages_scraped"] == 1
     assert summary["records_extracted"] == summary["records_transformed"] == 0
     assert summary["cache_only_run"] is False
-    if len(existing_formats) == 3:
-        assert runner.exporter.calls == []
-        for extension in existing_formats:
-            assert (tmp_path / f"quality_example.{extension}").read_text(encoding="utf-8") == "previous"
-    else:
-        assert [call[0] for call in runner.exporter.calls] == ["csv", "json", "xlsx"]
-        assert all(call[1] == [] for call in runner.exporter.calls)
-        assert all(summary[f"{extension}_path"].exists() for extension in ("csv", "json", "xlsx"))
+    assert [call[0] for call in runner.exporter.calls] == ["csv", "json", "xlsx"]
+    assert all(call[1] == [] for call in runner.exporter.calls)
+    assert all(summary[f"{extension}_path"].exists() for extension in ("csv", "json", "xlsx"))
+
 
 
 @pytest.mark.parametrize("failing_method", ["to_csv", "to_json", "to_excel"])
@@ -799,11 +795,8 @@ def test_quality_audits_exist_for_empty_and_nonempty_completed_runs(
     if case == "zero":
         assert all(value == 0 for value in report.values())
         assert rejected == []
-        if existing_normal_outputs:
-            assert runner.exporter.calls == []
-        else:
-            assert len(runner.exporter.calls) == 3
-            assert all(call[1] == [] for call in runner.exporter.calls)
+        assert len(runner.exporter.calls) == 3
+        assert all(call[1] == [] for call in runner.exporter.calls)
     elif case == "all_rejected":
         assert report["rejected"] == len(rejected) == 1
         assert report["exported"] == 0
@@ -836,36 +829,37 @@ def test_legacy_runs_never_touch_quality_artifacts(tmp_path, make_quality_runner
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_cache_only_runs_never_create_or_overwrite_quality_artifacts(
+def test_completion_preserves_audits_or_rebuilds_missing_artifacts(
     tmp_path, make_quality_runner, existing,
 ):
     runner, path = make_quality_runner()
+    runner.parser = FakeParser({
+        "https://example.com/page-1.html": [{"id": "bad", "title": "Rejected", "price": "1.0"}],
+    })
+    runner.run(path, tmp_path)
     targets = [tmp_path / f"quality_example.{kind}.json" for kind in ("quality", "rejected")]
-    if existing:
-        runner.parser = FakeParser({
-            "https://example.com/page-1.html": [{"id": "bad", "title": "Rejected", "price": "1.0"}],
-        })
-        runner.run(path, tmp_path)
-        previous = [target.read_bytes() for target in targets]
-        assert runner.last_quality_result.report.rejected == 1
-    profile = runner.loader.load(path)
-    profile.pop("pagination")
-    runner.loader = FakeLoader(profile)
-    runner.cache = FakeCache({profile["start_url"]})
-    runner.client = FakeClient({})
+    previous = [target.read_bytes() for target in targets]
+    assert runner.last_quality_result.report.rejected == 1
+    if not existing:
+        for target in targets:
+            target.unlink()
+    runner.client = FakeClient(runner.client.html_by_url)
     runner.exporter.calls.clear()
-    runner.exporter.write_quality_artifacts = Mock(side_effect=AssertionError("Audit must not run"))
+    runner.exporter.write_quality_artifacts = Mock(wraps=runner.exporter.write_quality_artifacts)
 
     summary = runner.run(path, tmp_path)
 
-    assert summary["cache_only_run"] is True
-    assert runner.last_quality_result.report.extracted == 0
-    assert runner.exporter.calls == []
-    runner.exporter.write_quality_artifacts.assert_not_called()
+    assert summary["cache_only_run"] is existing
+    assert [target.read_bytes() for target in targets] == previous
     if existing:
-        assert [target.read_bytes() for target in targets] == previous
+        assert runner.last_quality_result is None
+        assert runner.exporter.calls == []
+        runner.exporter.write_quality_artifacts.assert_not_called()
     else:
-        assert all(not target.exists() for target in targets)
+        assert runner.last_quality_result.report.rejected == 1
+        assert runner.last_quality_result.report.extracted == 1
+        assert len(runner.exporter.calls) == 3
+        runner.exporter.write_quality_artifacts.assert_called_once()
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -950,3 +944,822 @@ def test_normal_export_failure_keeps_successful_audits(tmp_path, make_quality_ru
     assert runner.exporter.write_quality_artifacts.call_args.args[0] is result
     assert json.loads((tmp_path / "quality_example.quality.json").read_text(encoding="utf-8")) == asdict(result.report)
     assert json.loads((tmp_path / "quality_example.rejected.json").read_text(encoding="utf-8")) == result.rejected_records
+
+
+@pytest.fixture
+def make_completion_runner(tmp_path, monkeypatch):
+    from core.cache import URLCache
+
+    cache = URLCache(str(tmp_path / "completion.db"))
+    monkeypatch.setattr(runner_module, "URLCache", lambda: cache)
+    monkeypatch.setattr(runner_module, "RobotsChecker", AllowAllRobots)
+    urls = [f"https://example.com/page-{number}.html" for number in range(1, 4)]
+    pages = {
+        url: f"<article><h2>Item {number}</h2></article>" + (
+            f'<a class="next" href="{urls[number]}">Next</a>' if number < 3 else ""
+        )
+        for number, url in enumerate(urls, 1)
+    }
+
+    def make(quality=False, output_name="outputs"):
+        profile = {
+            "site_name": "Completion Example", "engine": "static", "start_url": urls[0],
+            "fields": {"title": "article h2::text"}, "max_pages": 3,
+            "pagination": {"next_button": "a.next"}, "data_quality": quality,
+        }
+        path = tmp_path / "completion.yaml"
+        path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+        runner = ScrapeRunner(client=FakeClient(pages))
+        return runner, path, tmp_path / output_name, urls
+
+    return make
+
+
+def test_completed_rerun_does_not_refetch_pagination_regression(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner()
+    first = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    before = {key: first[key].read_bytes() for key in ("csv_path", "json_path", "xlsx_path")}
+    runner.client = FakeClient(runner.client.html_by_url)
+
+    second = runner.run(path, output_dir)
+
+    assert runner.client.calls == []
+    assert second["cache_only_run"] is True
+    assert {key: second[key].read_bytes() for key in before} == before
+
+
+def test_mixed_legacy_cache_cannot_overwrite_complete_exports_with_subset(make_completion_runner):
+    import sqlite3
+
+    runner, path, output_dir, urls = make_completion_runner()
+    first = runner.run(path, output_dir)
+    expected = [{"title": f"Item {number}"} for number in range(1, 4)]
+    assert json.loads(first["json_path"].read_text(encoding="utf-8")) == expected
+    # Reproduce a partial legacy cache while one required output needs recovery.
+    with sqlite3.connect(runner.cache.db_path) as connection:
+        connection.execute("DELETE FROM url_cache")
+    runner.cache.mark_done(urls[0], 1)
+    first["xlsx_path"].unlink()
+    runner.client = FakeClient(runner.client.html_by_url)
+
+    rebuilt = runner.run(path, output_dir)
+
+    assert json.loads(rebuilt["json_path"].read_text(encoding="utf-8")) == expected
+    assert runner.client.calls == urls
+    assert rebuilt["records_extracted"] == 3
+    assert rebuilt["cached_skips"] == 0
+
+
+
+def completion_rows(cache):
+    from contextlib import closing
+    import sqlite3
+
+    with closing(sqlite3.connect(cache.db_path)) as connection:
+        return connection.execute("SELECT * FROM run_completions ORDER BY output_key").fetchall()
+
+
+def expected_run_paths(summary, quality):
+    paths = [summary[key] for key in ("csv_path", "json_path", "xlsx_path")]
+    if quality:
+        paths.extend(summary["csv_path"].with_suffix(f".{kind}.json") for kind in ("quality", "rejected"))
+    return paths
+
+
+@pytest.mark.parametrize("quality", [False, True])
+@pytest.mark.parametrize("engine", ["static", "browser"])
+def test_completed_rerun_is_entirely_read_only_including_database(
+    make_completion_runner, monkeypatch, quality, engine,
+):
+    import sqlite3
+    import core.cache as cache_module
+
+    runner, path, output_dir, urls = make_completion_runner(quality=quality)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["engine"] = engine
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    first = runner.run(path, output_dir)
+    files = expected_run_paths(first, quality)
+    before = {file: (file.read_bytes(), file.stat().st_mtime_ns) for file in files}
+    database = (runner.cache.db_path.read_bytes(), runner.cache.db_path.stat().st_mtime_ns)
+    database_size = runner.cache.db_path.stat().st_size
+    sidecars = [Path(str(runner.cache.db_path) + suffix) for suffix in ("-journal", "-wal", "-shm")]
+    sidecars_before = {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns)
+                       for file in sidecars if file.exists()}
+    rows = completion_rows(runner.cache)
+    assert len(rows) == 1 and rows[0][2] == 3
+    runner.client = FakeClient({})
+    for target, methods in (
+        (runner.parser, ("extract",)), (runner.transformer, ("transform",)),
+        (runner.quality_processor, ("process",)),
+        (runner.exporter, ("to_csv", "to_json", "to_excel", "write_quality_artifacts")),
+        (runner.cache, ("invalidate_run", "mark_complete", "clear_runs", "mark_done", "clear")),
+    ):
+        for method in methods:
+            monkeypatch.setattr(target, method, Mock(side_effect=AssertionError(f"Unexpected {method}")))
+    robots = Mock(side_effect=AssertionError("No robots network request"))
+    factory = Mock(side_effect=AssertionError("No browser/client construction"))
+    monkeypatch.setattr(runner_module, "RobotsChecker", robots)
+    monkeypatch.setattr(runner_module, "create_client", factory)
+    original_connect = sqlite3.connect
+    statements, total_changes = [], []
+
+    class ObservedConnection(sqlite3.Connection):
+        def close(self):
+            total_changes.append(self.total_changes)
+            return super().close()
+
+    def connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs, factory=ObservedConnection)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_module.sqlite3, "connect", connect)
+        summary = runner.run(path, output_dir)
+    assert statements and all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    assert runner.client.calls == []
+    assert runner.client.enter_count == runner.client.exit_count == 0
+    assert runner.last_quality_result is None
+    assert summary == {
+        "site_name": "Completion Example", "pages_scraped": 0, "records_extracted": 0,
+        "records_transformed": 0, "cached_skips": 3, "robots_blocked": 0,
+        "cache_only_run": True, "csv_path": first["csv_path"],
+        "json_path": first["json_path"], "xlsx_path": first["xlsx_path"],
+    }
+    assert {file: (file.read_bytes(), file.stat().st_mtime_ns) for file in files} == before
+    assert (runner.cache.db_path.read_bytes(), runner.cache.db_path.stat().st_mtime_ns) == database
+    assert completion_rows(runner.cache) == rows
+    assert completion_rows(runner.cache)[0][3] == rows[0][3]  # completed_at
+    assert runner.cache.db_path.stat().st_size == database_size
+    assert total_changes == [0]
+    assert {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns)
+            for file in sidecars if file.exists()} == sidecars_before
+    robots.assert_not_called()
+    factory.assert_not_called()
+
+
+def test_completion_is_last_and_identity_uses_one_expanded_profile_snapshot(
+    make_completion_runner, monkeypatch,
+):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    loaded = runner.loader.load(path)
+    before = deepcopy(loaded)
+    runner.loader.load = Mock(return_value=loaded)
+    identity = Mock(wraps=runner_module.run_identity)
+    monkeypatch.setattr(runner_module, "run_identity", identity)
+    events = []
+    for target, methods in (
+        (runner.client, ("fetch",)), (runner.parser, ("extract",)),
+        (runner.transformer, ("transform",)), (runner.quality_processor, ("process",)),
+        (runner.exporter, ("write_quality_artifacts", "to_csv", "to_json", "to_excel")),
+        (runner.cache, ("invalidate_run", "mark_complete")),
+    ):
+        for name in methods:
+            original = getattr(target, name)
+
+            def call(*args, _name=name, _original=original, **kwargs):
+                events.append(_name)
+                if _name != "invalidate_run":
+                    assert completion_rows(runner.cache) == []
+                if _name == "mark_complete":
+                    assert all(file.stat().st_size > 0 for file in output_dir.iterdir())
+                    assert len(list(output_dir.iterdir())) == 5
+                return _original(*args, **kwargs)
+
+            setattr(target, name, Mock(side_effect=call))
+    summary = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert summary["records_extracted"] == 3
+    assert events == ["invalidate_run", "fetch", "extract", "fetch", "extract", "fetch", "extract",
+                      "transform", "process", "write_quality_artifacts", "to_csv", "to_json",
+                      "to_excel", "mark_complete"]
+    runner.loader.load.assert_called_once_with(path)
+    identity.assert_called_once_with(loaded, summary["csv_path"])
+    assert identity.call_args.args[0] is loaded
+    assert loaded == before
+    assert loaded["fields"]["title"] == {
+        "selector": "article h2::text", "required": False, "type": "string",
+    }
+    assert completion_rows(runner.cache)[0][2] == 3
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".json", ".xlsx", ".quality.json", ".rejected.json"])
+@pytest.mark.parametrize("damage", ["missing", "empty"])
+def test_incomplete_output_rebuilds_every_page_and_all_required_files(
+    make_completion_runner, suffix, damage,
+):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    damaged = first["csv_path"].with_suffix(suffix)
+    if damage == "missing":
+        damaged.unlink()
+    else:
+        damaged.write_bytes(b"")
+    runner.client = FakeClient(runner.client.html_by_url)
+    original_fetch = runner.client.fetch
+
+    def fetch(url, wait_for=None):
+        assert completion_rows(runner.cache) == []  # visible from a separate connection
+        return original_fetch(url, wait_for=wait_for)
+
+    runner.client.fetch = fetch
+    rebuilt = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert rebuilt["cache_only_run"] is False
+    assert rebuilt["records_extracted"] == rebuilt["records_transformed"] == 3
+    assert rebuilt["cached_skips"] == 0
+    assert all(file.is_file() and file.stat().st_size > 0 for file in expected_run_paths(rebuilt, True))
+    assert len(json.loads(rebuilt["json_path"].read_text(encoding="utf-8"))) == 3
+    assert runner.last_quality_result.report.extracted == 3
+    assert completion_rows(runner.cache)[0][2] == 3
+
+
+@pytest.mark.parametrize("quality", [False, True])
+def test_completion_without_any_outputs_rebuilds(make_completion_runner, quality):
+    runner, path, output_dir, urls = make_completion_runner(quality=quality)
+    first = runner.run(path, output_dir)
+    for file in expected_run_paths(first, quality):
+        file.unlink()
+    runner.client = FakeClient(runner.client.html_by_url)
+    second = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert second["records_extracted"] == 3
+    assert all(file.is_file() and file.stat().st_size > 0 for file in expected_run_paths(second, quality))
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".json", ".xlsx", ".quality.json", ".rejected.json"])
+def test_directory_at_output_path_is_not_completion_evidence(make_completion_runner, suffix):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    target = first["csv_path"].with_suffix(suffix)
+    target.unlink()
+    target.mkdir()
+    runner.client = FakeClient(runner.client.html_by_url)
+    with pytest.raises(OSError):
+        runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert completion_rows(runner.cache) == []
+    assert target.is_dir()  # Never delete a user's directory to make room for a file.
+    target.rmdir()
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert target.is_file()
+
+
+def test_legacy_rows_are_preserved_ignored_and_never_written_by_runner(make_completion_runner):
+    import sqlite3
+
+    runner, path, output_dir, urls = make_completion_runner()
+    for url in urls:
+        runner.cache.mark_done(url, 99)
+    with sqlite3.connect(runner.cache.db_path) as connection:
+        previous = connection.execute("SELECT * FROM url_cache ORDER BY url").fetchall()
+    runner.cache.mark_done = Mock(side_effect=AssertionError("No per-page writes"))
+    runner.cache.is_cached = Mock(side_effect=AssertionError("No per-page skips"))
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    runner.client = FakeClient({})
+    assert runner.run(path, output_dir)["cache_only_run"] is True
+    assert runner.client.calls == []
+    with sqlite3.connect(runner.cache.db_path) as connection:
+        assert connection.execute("SELECT * FROM url_cache ORDER BY url").fetchall() == previous
+    runner.cache.mark_done.assert_not_called()
+    runner.cache.is_cached.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["fetch", "extract", "transform", "process", "write_quality_artifacts",
+                                    "to_csv", "to_json", "to_excel"])
+def test_failed_stage_never_completes_and_next_invocation_rebuilds(make_completion_runner, stage):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    target = {
+        "fetch": runner.client, "extract": runner.parser, "transform": runner.transformer,
+        "process": runner.quality_processor,
+    }.get(stage, runner.exporter)
+    original = getattr(target, stage)
+    error = RuntimeError(f"{stage} failed")
+    setattr(target, stage, Mock(side_effect=error))
+    normal_methods = ("to_csv", "to_json", "to_excel")
+    for method in normal_methods:
+        if method != stage:
+            setattr(runner.exporter, method, Mock(wraps=getattr(runner.exporter, method)))
+    with pytest.raises(RuntimeError) as caught:
+        runner.run(path, output_dir)
+    assert caught.value is error
+    assert completion_rows(runner.cache) == []
+    if stage not in normal_methods:
+        for method in normal_methods:
+            getattr(runner.exporter, method).assert_not_called()
+    setattr(target, stage, original)
+    runner.client = FakeClient(runner.client.html_by_url)
+    summary = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert summary["records_extracted"] == 3
+    assert len(completion_rows(runner.cache)) == 1
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_interrupted_recovery_commits_invalidation_and_next_run_fully_rebuilds(
+    make_completion_runner, error_type,
+):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    first["xlsx_path"].write_bytes(b"")
+    runner.client = FakeClient(runner.client.html_by_url)
+    original_extract = runner.parser.extract
+    error = error_type("interrupted after first fetch")
+
+    def abort(*args):
+        assert runner.client.calls == [urls[0]]
+        assert completion_rows(runner.cache) == []
+        # Even if the missing file reappears, the deleted marker must not revive.
+        first["xlsx_path"].write_bytes(b"non-empty old output")
+        raise error
+
+    runner.parser.extract = abort
+    with pytest.raises(error_type) as caught:
+        runner.run(path, output_dir)
+    assert caught.value is error
+    assert completion_rows(runner.cache) == []
+    assert runner.client.closed
+    runner.parser.extract = original_extract
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert runner.last_quality_result.report.extracted == 3
+
+
+def test_invalidation_failure_prevents_all_network_and_output_work(make_completion_runner, monkeypatch):
+    import sqlite3
+
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    first["json_path"].unlink()
+    before = {file: file.read_bytes() for file in output_dir.iterdir()}
+    rows = completion_rows(runner.cache)
+    with sqlite3.connect(runner.cache.db_path) as connection:
+        connection.execute("""CREATE TRIGGER deny_invalidation BEFORE DELETE ON run_completions
+                              BEGIN SELECT RAISE(ABORT, 'invalidation failed'); END""")
+    runner.client = FakeClient({})
+    robots = Mock(side_effect=AssertionError("Network must not begin"))
+    monkeypatch.setattr(runner_module, "RobotsChecker", robots)
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        setattr(runner.exporter, method, Mock(side_effect=AssertionError("No output writes")))
+    with pytest.raises(sqlite3.IntegrityError, match="invalidation failed"):
+        runner.run(path, output_dir)
+    assert runner.client.calls == []
+    assert runner.client.enter_count == 0
+    assert runner.last_quality_result is None
+    robots.assert_not_called()
+    assert completion_rows(runner.cache) == rows
+    assert {file: file.read_bytes() for file in output_dir.iterdir()} == before
+
+
+def test_completion_write_failure_keeps_outputs_but_next_run_rebuilds(make_completion_runner):
+    import sqlite3
+
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    with sqlite3.connect(runner.cache.db_path) as connection:
+        connection.execute("""CREATE TRIGGER deny_completion BEFORE INSERT ON run_completions
+                              BEGIN SELECT RAISE(ABORT, 'completion failed'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match="completion failed"):
+        runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert completion_rows(runner.cache) == []
+    assert runner.last_quality_result.report.extracted == 3
+    assert len(list(output_dir.iterdir())) == 5
+    assert all(file.is_file() and file.stat().st_size > 0 for file in output_dir.iterdir())
+    with sqlite3.connect(runner.cache.db_path) as connection:
+        connection.execute("DROP TRIGGER deny_completion")
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert len(completion_rows(runner.cache)) == 1
+
+
+def test_distinct_destinations_do_not_share_completion(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner()
+    runner.run(path, output_dir)
+    runner.client = FakeClient(runner.client.html_by_url)
+    other = output_dir.parent / "different"
+    runner.run(path, other)
+    assert runner.client.calls == urls
+    assert len(completion_rows(runner.cache)) == 2
+    runner.client = FakeClient({})
+    assert runner.run(path, output_dir)["cache_only_run"] is True
+    assert runner.run(path, other)["cache_only_run"] is True
+    assert runner.client.calls == []
+
+
+@pytest.mark.parametrize("second_run_fails", [False, True])
+def test_profile_switch_cannot_reuse_marker_for_overwritten_outputs(make_completion_runner, second_run_fails):
+    runner, path, output_dir, urls = make_completion_runner()
+    runner.run(path, output_dir)
+    original_profile = path.read_text(encoding="utf-8")
+    profile = yaml.safe_load(original_profile)
+    profile["max_pages"] = 1
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.client = FakeClient(runner.client.html_by_url)
+    original_excel = runner.exporter.to_excel
+    if second_run_fails:
+        runner.exporter.to_excel = Mock(side_effect=RuntimeError("export failed"))
+        with pytest.raises(RuntimeError, match="export failed"):
+            runner.run(path, output_dir)
+        assert completion_rows(runner.cache) == []
+    else:
+        runner.run(path, output_dir)
+    runner.exporter.to_excel = original_excel
+    path.write_text(original_profile, encoding="utf-8")
+    runner.client = FakeClient(runner.client.html_by_url)
+    result = runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert result["records_extracted"] == 3
+
+
+def test_reordered_loaded_profile_skips_but_changed_selector_rebuilds(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    runner.run(path, output_dir)
+    profile = runner.loader.load(path)
+    runner.loader = FakeLoader(dict(reversed(list(profile.items()))))
+    runner.client = FakeClient({})
+    assert runner.run(path, output_dir)["cache_only_run"] is True
+    changed = deepcopy(profile)
+    changed["fields"]["title"]["selector"] = "article > h2::text"
+    runner.loader = FakeLoader(changed)
+    runner.client = FakeClient({url: "<article><h2>Updated</h2></article>" for url in urls})
+    assert runner.run(path, output_dir)["cache_only_run"] is False
+    assert runner.client.calls == [urls[0]]
+
+
+def test_robots_blocked_run_does_not_record_completion(make_completion_runner, monkeypatch):
+    runner, path, output_dir, urls = make_completion_runner()
+    blocked = Mock()
+    blocked.is_allowed.return_value = False
+    monkeypatch.setattr(runner_module, "RobotsChecker", Mock(return_value=blocked))
+    result = runner.run(path, output_dir)
+    assert result["robots_blocked"] == 1
+    assert completion_rows(runner.cache) == []
+    monkeypatch.setattr(runner_module, "RobotsChecker", AllowAllRobots)
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+
+
+def test_three_page_fresh_skip_recovery_demonstration(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    fetches = [len(runner.client.calls)]
+    runner.client = FakeClient(runner.client.html_by_url)
+    second = runner.run(path, output_dir)
+    fetches.append(len(runner.client.calls))
+    first["csv_path"].unlink()
+    runner.client = FakeClient(runner.client.html_by_url)
+    third = runner.run(path, output_dir)
+    fetches.append(len(runner.client.calls))
+    assert fetches == [3, 0, 3]
+    assert second["cache_only_run"] is True
+    assert third["records_extracted"] == third["records_transformed"] == 3
+    assert len(json.loads(third["json_path"].read_text(encoding="utf-8"))) == 3
+    assert all(file.is_file() and file.stat().st_size > 0 for file in expected_run_paths(third, True))
+    runner.client = FakeClient(runner.client.html_by_url)
+    fourth = runner.run(path, output_dir)
+    fetches.append(len(runner.client.calls))
+    assert fourth["cache_only_run"] is True
+    assert fetches == [3, 0, 3, 0]
+    print("Three-page demonstration: fetches = 3, 0, 3, 0; all five outputs restored; 3 records.")
+
+
+@pytest.mark.parametrize("quality", [False, True])
+def test_genuine_empty_run_replaces_old_outputs_then_completed_rerun_skips(make_completion_runner, quality):
+    runner, path, output_dir, urls = make_completion_runner(quality=quality)
+    first = runner.run(path, output_dir)
+    runner.client = FakeClient({urls[0]: "<html>No records</html>"})
+    second = runner.run(path, output_dir, clear_cache=True)
+    assert second["records_extracted"] == second["records_transformed"] == 0
+    assert second["pages_scraped"] == 1
+    assert json.loads(second["json_path"].read_text(encoding="utf-8")) == []
+    assert second["csv_path"].read_text(encoding="utf-8").strip() == ""
+    workbook = load_workbook(second["xlsx_path"])
+    try:
+        assert list(workbook.active.values) == []
+    finally:
+        workbook.close()
+    if quality:
+        report = json.loads(second["csv_path"].with_suffix(".quality.json").read_text(encoding="utf-8"))
+        assert all(value == 0 for value in report.values())
+        assert json.loads(second["csv_path"].with_suffix(".rejected.json").read_text(encoding="utf-8")) == []
+    runner.client = FakeClient({})
+    third = runner.run(path, output_dir)
+    assert third["cache_only_run"] is True
+    assert third["cached_skips"] == 1
+    assert runner.client.calls == []
+    assert runner.last_quality_result is None
+
+
+def test_nonempty_corrupt_outputs_are_not_content_validated(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    for file in expected_run_paths(first, True):
+        file.write_bytes(b"nonempty content is intentionally not validated")
+    runner.client = FakeClient({})
+    assert runner.run(path, output_dir)["cache_only_run"] is True
+    assert runner.client.calls == []
+    assert all(file.read_bytes() == b"nonempty content is intentionally not validated"
+               for file in expected_run_paths(first, True))
+
+
+def test_profile_file_changes_during_fetch_do_not_change_current_snapshot(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    original_profile = runner.loader.load(path)
+    original_fetch = runner.client.fetch
+    original_process = runner.quality_processor.process
+    runner.loader.load = Mock(wraps=runner.loader.load)
+    observed = []
+
+    def fetch(url, wait_for=None):
+        path.write_text("invalid: new profile for a later invocation", encoding="utf-8")
+        return original_fetch(url, wait_for=wait_for)
+
+    def process(records, profile):
+        assert profile == original_profile
+        observed.append(profile)
+        return original_process(records, profile)
+
+    runner.client.fetch = fetch
+    runner.quality_processor.process = process
+    result = runner.run(path, output_dir)
+    runner.loader.load.assert_called_once_with(path)
+    assert len(observed) == 1
+    assert runner.client.calls == urls
+    output_key, fingerprint = runner_module.run_identity(original_profile, result["csv_path"])
+    assert runner.cache.completed_pages(output_key, fingerprint) == 3
+
+
+def test_exporter_that_leaves_empty_required_output_cannot_mark_completion(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner()
+    original_json = runner.exporter.to_json
+
+    def empty_json(records, output_path):
+        output_path.write_bytes(b"")
+        return output_path
+
+    runner.exporter.to_json = empty_json
+    with pytest.raises(RuntimeError, match="missing or empty"):
+        runner.run(path, output_dir)
+    assert completion_rows(runner.cache) == []
+    runner.exporter.to_json = original_json
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+
+
+
+def test_explicit_clear_cache_preserves_historical_full_clear_scope(make_completion_runner, monkeypatch):
+    import sqlite3
+
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    runner.run(path, output_dir)
+    runner.cache.mark_done(urls[0], 99)
+    runner.cache.mark_complete("unrelated-output", "other-profile", 2)
+    pages = runner.client.html_by_url
+    fresh_client = FakeClient(pages)
+    runner.client = None
+
+    def create(engine):
+        assert completion_rows(runner.cache) == []
+        with sqlite3.connect(runner.cache.db_path) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM url_cache").fetchone() == (0,)
+        return fresh_client
+
+    factory = Mock(side_effect=create)
+    monkeypatch.setattr(runner_module, "create_client", factory)
+    summary = runner.run(path, output_dir, clear_cache=True)
+
+    factory.assert_called_once_with("static")
+    assert fresh_client.calls == urls
+    assert summary["cache_only_run"] is False
+    assert len(completion_rows(runner.cache)) == 1
+    assert not runner.cache.is_cached(urls[0])
+
+
+def test_recovery_invalidation_is_committed_before_client_and_preserves_other_jobs(
+    make_completion_runner, monkeypatch,
+):
+    runner, path, output_dir, urls = make_completion_runner()
+    first = runner.run(path, output_dir)
+    runner.cache.mark_done(urls[0], 99)
+    runner.cache.mark_complete("unrelated-output", "other-profile", 2)
+    other = [row for row in completion_rows(runner.cache) if row[0] == "unrelated-output"]
+    first["json_path"].unlink()
+    fresh_client = FakeClient(runner.client.html_by_url)
+    runner.client = None
+    runner.cache.clear = Mock(side_effect=AssertionError("Recovery must not clear all caches"))
+
+    def create(engine):
+        assert completion_rows(runner.cache) == other
+        assert runner.cache.is_cached(urls[0])
+        return fresh_client
+
+    factory = Mock(side_effect=create)
+    monkeypatch.setattr(runner_module, "create_client", factory)
+    runner.run(path, output_dir)
+
+    factory.assert_called_once_with("static")
+    assert fresh_client.calls == urls
+    assert [row for row in completion_rows(runner.cache) if row[0] == "unrelated-output"] == other
+    assert runner.cache.is_cached(urls[0])
+    runner.cache.clear.assert_not_called()
+
+
+@pytest.mark.parametrize("setting, value", [
+    (("site_name",), "Different Output"), (("engine",), "browser"),
+    (("start_url",), "https://example.com/new-start.html"), (("max_pages",), 2),
+    (("pagination", "next_button"), "a.other"), (("delay",), 1), (("wait_for",), "article"),
+    (("fields", "title", "selector"), "article h2:not(.excluded)::text"),
+    (("fields", "title", "required"), True), (("fields", "title", "type"), "URL"),
+    (("fields", "date", "format"), "%d/%m/%Y"), (("data_quality",), False),
+    (("unique_key",), ["title"]), (("duplicate_policy",), "report_only"),
+    (("include_provenance",), True), (("record_selector",), "article"),
+    (("transform",), {"title": "strip"}), (("transformation",), {"title": "strip"}),
+    (("transformations",), {"title": "strip"}),
+])
+def test_each_included_profile_category_forces_actual_rebuild(
+    make_completion_runner, monkeypatch, setting, value,
+):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["fields"]["title"] = {"selector": "article h2::text"}
+    profile["fields"]["date"] = {"selector": "article time::text", "type": "date", "format": "%Y-%m-%d"}
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.run(path, output_dir)
+    target = profile
+    for key in setting[:-1]:
+        target = target[key]
+    target[setting[-1]] = value
+    if setting == ("data_quality",):
+        profile["fields"] = {name: definition["selector"] for name, definition in profile["fields"].items()}
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    pages = dict(runner.client.html_by_url)
+    pages[profile["start_url"]] = pages[urls[0]]
+    runner.client = FakeClient(pages)
+    monkeypatch.setattr(runner_module.time, "sleep", Mock())
+
+    result = runner.run(path, output_dir)
+
+    assert result["cache_only_run"] is False
+    assert runner.client.calls and runner.client.calls[0] == profile["start_url"]
+    assert result["pages_scraped"] == len(runner.client.calls)
+
+
+@pytest.mark.parametrize("key, value", [
+    ("description", "Reworded description"), ("owner", "Delivery team"),
+    ("tags", ["portfolio", "reviewed"]), ("notes", {"revision": 2}),
+])
+def test_excluded_behavior_neutral_metadata_does_not_rebuild(make_completion_runner, key, value):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    before = {file: file.read_bytes() for file in expected_run_paths(first, True)}
+    rows = completion_rows(runner.cache)
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile[key] = value
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.client = FakeClient({})
+
+    result = runner.run(path, output_dir)
+
+    assert result["cache_only_run"] is True
+    assert runner.client.calls == []
+    assert completion_rows(runner.cache) == rows
+    assert {file: file.read_bytes() for file in before} == before
+
+
+@pytest.mark.parametrize("failed_artifact", [1, 2])
+def test_either_audit_file_failure_invalidates_completion_and_next_run_rebuilds(
+    make_completion_runner, monkeypatch, failed_artifact,
+):
+    import core.exporter as exporter_module
+
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    first = runner.run(path, output_dir)
+    first["csv_path"].unlink()
+    runner.client = FakeClient(runner.client.html_by_url)
+    original_dump = exporter_module.json.dump
+    calls = []
+    error = OSError("audit artifact write failed")
+
+    def fail(data, handle, **kwargs):
+        calls.append(handle.name)
+        if len(calls) == failed_artifact:
+            handle.write("partial")
+            raise error
+        return original_dump(data, handle, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(exporter_module.json, "dump", fail)
+        with pytest.raises(OSError) as caught:
+            runner.run(path, output_dir)
+    assert caught.value is error
+    assert len(calls) == failed_artifact
+    assert completion_rows(runner.cache) == []
+    assert not first["csv_path"].exists()
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.client.calls == urls
+    assert runner.last_quality_result.report.extracted == 3
+    assert len(completion_rows(runner.cache)) == 1
+
+
+def test_legacy_only_database_migrates_then_rebuilds_skips_and_full_clears(tmp_path, monkeypatch):
+    from contextlib import closing
+    import sqlite3
+    from core.cache import URLCache
+
+    db = tmp_path / "old.db"
+    url = "https://example.com/old"
+    with closing(sqlite3.connect(db)) as connection, connection:
+        connection.execute("""CREATE TABLE url_cache (
+            url TEXT PRIMARY KEY, record_count INTEGER NOT NULL,
+            scraped_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+        connection.execute("INSERT INTO url_cache VALUES (?, 99, '2000-01-01')", (url,))
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+        connection.execute("INSERT INTO unrelated VALUES ('retain')")
+    cache = URLCache(str(db))
+    monkeypatch.setattr(runner_module, "URLCache", lambda: cache)
+    monkeypatch.setattr(runner_module, "RobotsChecker", AllowAllRobots)
+    path = tmp_path / "legacy.yaml"
+    profile = {"site_name": "Migration", "engine": "static", "start_url": url,
+               "fields": {"title": "article h2::text"}}
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner = ScrapeRunner(client=FakeClient({url: "<article><h2>Current</h2></article>"}))
+    assert cache.is_cached(url)
+    assert completion_rows(cache) == []
+    first = runner.run(path, tmp_path / "outputs")
+    assert runner.client.calls == [url]
+    assert first["records_extracted"] == 1
+    assert cache.is_cached(url)
+    assert len(completion_rows(cache)) == 1
+    runner.client = FakeClient({})
+    assert runner.run(path, tmp_path / "outputs")["cache_only_run"] is True
+    assert runner.client.calls == []
+    cache.clear()
+    assert not cache.is_cached(url)
+    assert completion_rows(cache) == []
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute("SELECT * FROM unrelated").fetchall() == [("retain",)]
+
+
+def test_zero_record_files_are_nonempty_and_identical_rerun_is_read_only(
+    make_completion_runner, monkeypatch,
+):
+    import sqlite3
+    import core.cache as cache_module
+
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    runner.client = FakeClient({urls[0]: "<html>No listings</html>"})
+    first = runner.run(path, output_dir)
+    files = expected_run_paths(first, True)
+    sizes = {file.name: file.stat().st_size for file in files}
+    assert first["records_extracted"] == first["records_transformed"] == 0
+    assert all(file.is_file() and file.stat().st_size > 0 for file in files)
+    rows = completion_rows(runner.cache)
+    before = {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns)
+              for file in files + [runner.cache.db_path]}
+    sidecars = [Path(str(runner.cache.db_path) + suffix) for suffix in ("-journal", "-wal", "-shm")]
+    sidecars_before = {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns)
+                       for file in sidecars if file.exists()}
+    original_connect = sqlite3.connect
+    statements, totals = [], []
+
+    class ObservedConnection(sqlite3.Connection):
+        def close(self):
+            totals.append(self.total_changes)
+            return super().close()
+
+    def connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs, factory=ObservedConnection)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    runner.client = FakeClient({})
+    for target, methods in (
+        (runner.parser, ("extract",)), (runner.transformer, ("transform",)),
+        (runner.quality_processor, ("process",)),
+        (runner.exporter, ("to_csv", "to_json", "to_excel", "write_quality_artifacts")),
+    ):
+        for name in methods:
+            setattr(target, name, Mock(side_effect=AssertionError("No rerun work or output writes")))
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_module.sqlite3, "connect", connect)
+        second = runner.run(path, output_dir)
+    assert second["cache_only_run"] is True
+    assert runner.client.calls == []
+    assert runner.last_quality_result is None
+    assert totals == [0]
+    assert statements and all(statement.strip().upper().startswith("SELECT") for statement in statements)
+    assert completion_rows(runner.cache) == rows
+    assert {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns) for file in before} == before
+    assert {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns)
+            for file in sidecars if file.exists()} == sidecars_before
+    print("Zero-record bytes:", sizes, "; identical rerun: 0 fetches, 0 writes, total_changes=0")
