@@ -2,12 +2,28 @@ import logging
 from types import TracebackType
 from typing import Self
 
-from requests import Session
+from requests import HTTPError, Response, Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 logger = logging.getLogger(__name__)
+
+
+class HTTPStatusError(HTTPError):
+    """A final main-document response outside the successful 2xx range."""
+
+    def __init__(
+        self, requested_url: str, status_code: int, final_url: str | None = None,
+        *, response: Response | None = None,
+    ) -> None:
+        self.requested_url = requested_url
+        self.final_url = final_url
+        self.status_code = status_code
+        super().__init__(
+            f"Fetch failed with HTTP {status_code} for {final_url or requested_url}",
+            response=response,
+        )
 
 
 class HttpClient:
@@ -54,7 +70,8 @@ class HttpClient:
         try:
             response = self.session.get(url, timeout=self.timeout)
             self.last_status_code = response.status_code
-            response.raise_for_status()
+            if not 200 <= response.status_code < 300:
+                raise HTTPStatusError(url, response.status_code, response.url, response=response)
         except Exception:
             logger.exception("Failed to fetch URL: %s", url)
             raise

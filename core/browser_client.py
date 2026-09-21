@@ -4,6 +4,8 @@ from typing import Self
 
 from playwright.sync_api import Browser, BrowserContext, Playwright, sync_playwright
 
+from core.http_client import HTTPStatusError
+
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,11 @@ class BrowserClient:
         fetch_failed = False
         try:
             response = page.goto(url, wait_until="domcontentloaded")
-            self.last_status_code = response.status if response else None
+            if response is None:
+                raise RuntimeError(f"Browser navigation returned no main-document response for {url}")
+            self.last_status_code = response.status
+            if not 200 <= response.status < 300:
+                raise HTTPStatusError(url, response.status, response.url)
 
             if wait_for:
                 page.wait_for_selector(wait_for)

@@ -1763,3 +1763,234 @@ def test_zero_record_files_are_nonempty_and_identical_rerun_is_read_only(
     assert {file: (file.read_bytes(), file.stat().st_size, file.stat().st_mtime_ns)
             for file in sidecars if file.exists()} == sidecars_before
     print("Zero-record bytes:", sizes, "; identical rerun: 0 fetches, 0 writes, total_changes=0")
+
+
+@pytest.fixture
+def make_status_runner(make_completion_runner, monkeypatch):
+    from types import SimpleNamespace
+    from requests import Response
+    import core.browser_client as browser_module
+    from core.browser_client import BrowserClient
+    from core.http_client import HttpClient
+
+    def make(engine):
+        runner, path, output_dir, urls = make_completion_runner(quality=True)
+        profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+        profile["engine"] = engine
+        path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+        pages = dict(runner.client.html_by_url)
+        state = SimpleNamespace(statuses={}, calls=[], pages=[], sessions=[], cleanups=[])
+
+        def new_client():
+            state.calls = []
+            state.pages = []
+            state.cleanups = []
+            if engine == "static":
+                client = HttpClient()
+                original_close = client.session.close
+                client.session.close = Mock(wraps=original_close)
+                state.sessions.append(client.session)
+
+                def get(url, **kwargs):
+                    state.calls.append(url)
+                    response = Response()
+                    response.status_code = state.statuses.get(url, 200)
+                    response.url = url
+                    html = pages[url] if response.status_code < 300 else "<article><h2>HTTP error page</h2></article>"
+                    response._content = html.encode("utf-8")
+                    return response
+
+                monkeypatch.setattr(client.session, "get", Mock(side_effect=get))
+                return client
+            context = Mock()
+            browser = Mock()
+            playwright = Mock()
+            manager = Mock()
+            manager.start.return_value = playwright
+            playwright.chromium.launch.return_value = browser
+            browser.new_context.return_value = context
+            for resource, label in ((context, "context"), (browser, "browser"), (playwright, "playwright")):
+                method = "stop" if label == "playwright" else "close"
+                getattr(resource, method).side_effect = lambda _label=label: state.cleanups.append(_label)
+
+            def new_page():
+                page = Mock()
+
+                def goto(url, **kwargs):
+                    state.calls.append(url)
+                    status = state.statuses.get(url, 200)
+                    page.content.return_value = pages[url] if status < 300 else "<article><h2>HTTP error page</h2></article>"
+                    return SimpleNamespace(status=status, url=url)
+
+                page.goto.side_effect = goto
+                state.pages.append(page)
+                return page
+
+            context.new_page.side_effect = new_page
+            monkeypatch.setattr(browser_module, "sync_playwright", lambda: manager)
+            return BrowserClient()
+
+        state.new_client = new_client
+        runner.client = new_client()
+        return runner, path, output_dir, urls, state
+
+    return make
+
+
+@pytest.mark.parametrize("engine, status", [("static", 302), ("browser", 429)])
+def test_non_2xx_page_cannot_reach_parser_exports_or_completion_regression(make_status_runner, engine, status):
+    from requests import HTTPError
+
+    runner, path, output_dir, urls, state = make_status_runner(engine)
+    state.statuses[urls[1]] = status
+    runner.parser.extract = Mock(wraps=runner.parser.extract)
+    observed = None
+    try:
+        runner.run(path, output_dir)
+    except HTTPError as error:
+        observed = error
+    assert observed is not None, (
+        f"HTTP {status} was accepted: parser calls={runner.parser.extract.call_count}, "
+        f"output files={len(list(output_dir.glob('*')))}, completion rows={len(completion_rows(runner.cache))}"
+    )
+    assert runner.parser.extract.call_count == 1
+    assert not list(output_dir.glob("*"))
+    assert completion_rows(runner.cache) == []
+
+
+@pytest.mark.parametrize("engine", ["static", "browser"])
+@pytest.mark.parametrize("failed_index", [0, 1, 2], ids=["first", "middle", "final"])
+@pytest.mark.parametrize("recovery", [False, True], ids=["fresh", "recovery"])
+def test_status_failure_preserves_all_outputs_and_next_run_rebuilds_from_start(
+    make_status_runner, engine, failed_index, recovery,
+):
+    from core.http_client import HTTPStatusError
+
+    runner, path, output_dir, urls, state = make_status_runner(engine)
+    before = {}
+    old_rows = []
+    if recovery:
+        first = runner.run(path, output_dir)
+        assert state.calls == urls
+        assert runner.last_quality_result.report.extracted == 3
+        before = {file: file.read_bytes() for file in expected_run_paths(first, True)}
+        old_rows = completion_rows(runner.cache)
+        profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+        profile["max_pages"] = 4
+        path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+        runner.client = state.new_client()
+    state.statuses[urls[failed_index]] = 429
+    runner.parser.extract = Mock(wraps=runner.parser.extract)
+    runner.transformer.transform = Mock(wraps=runner.transformer.transform)
+    runner.quality_processor.process = Mock(wraps=runner.quality_processor.process)
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        setattr(runner.exporter, method, Mock(wraps=getattr(runner.exporter, method)))
+    runner.cache.mark_complete = Mock(wraps=runner.cache.mark_complete)
+    original_fetch = runner.client.fetch
+    original_errors = []
+
+    def fetch(url, wait_for=None):
+        try:
+            return original_fetch(url, wait_for=wait_for)
+        except HTTPStatusError as error:
+            original_errors.append(error)
+            raise
+
+    runner.client.fetch = fetch
+    with pytest.raises(HTTPStatusError) as caught:
+        runner.run(path, output_dir)
+    assert caught.value is original_errors[0]
+    assert caught.value.status_code == 429
+    assert caught.value.requested_url == caught.value.final_url == urls[failed_index]
+    assert state.calls == urls[:failed_index + 1]
+    assert runner.parser.extract.call_count == failed_index
+    assert all("HTTP error page" not in call.args[0] for call in runner.parser.extract.call_args_list)
+    runner.transformer.transform.assert_not_called()
+    runner.quality_processor.process.assert_not_called()
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        getattr(runner.exporter, method).assert_not_called()
+    runner.cache.mark_complete.assert_not_called()
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == []
+    assert {file: file.read_bytes() for file in output_dir.glob("*")} == before
+    if recovery:
+        assert len(old_rows) == 1
+        assert runner.cache.completed_pages(old_rows[0][0], old_rows[0][1]) is None
+    if engine == "browser":
+        assert state.cleanups == ["context", "browser", "playwright"]
+        assert len(state.pages) == failed_index + 1
+        for page in state.pages:
+            page.close.assert_called_once_with()
+        state.pages[-1].content.assert_not_called()
+    else:
+        state.sessions[-1].close.assert_called_once_with()
+
+    state.statuses.clear()
+    runner.client = state.new_client()
+    result = runner.run(path, output_dir)
+    assert state.calls == urls
+    assert result["pages_scraped"] == result["records_extracted"] == result["records_transformed"] == 3
+    assert runner.last_quality_result.report.extracted == runner.last_quality_result.report.exported == 3
+    assert json.loads(result["json_path"].read_text(encoding="utf-8")) == [
+        {"title": f"Item {number}"} for number in range(1, 4)
+    ]
+    runner.cache.mark_complete.assert_called_once()
+    rows = completion_rows(runner.cache)
+    assert len(rows) == 1
+    if recovery:
+        assert rows[0][1] != old_rows[0][1]
+    files = expected_run_paths(result, True)
+    rebuilt_bytes = {file: file.read_bytes() for file in files}
+    state.calls.clear()
+    runner.cache.mark_complete.reset_mock()
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        getattr(runner.exporter, method).reset_mock()
+    skipped = runner.run(path, output_dir)
+    assert skipped["cache_only_run"] is True
+    assert state.calls == []
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == rows
+    runner.cache.mark_complete.assert_not_called()
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        getattr(runner.exporter, method).assert_not_called()
+    assert {file: file.read_bytes() for file in files} == rebuilt_bytes
+
+
+@pytest.mark.parametrize("engine", ["static", "browser"])
+def test_http_failure_recovery_demonstration(make_status_runner, engine):
+    from core.http_client import HTTPStatusError
+
+    runner, path, output_dir, urls, state = make_status_runner(engine)
+    first = runner.run(path, output_dir)
+    assert state.calls == urls
+    files = expected_run_paths(first, True)
+    before = {file: file.read_bytes() for file in files}
+    assert len(completion_rows(runner.cache)) == 1
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["max_pages"] = 4
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.client = state.new_client()
+    state.statuses[urls[1]] = 429
+    with pytest.raises(HTTPStatusError) as caught:
+        runner.run(path, output_dir)
+    assert caught.value.status_code == 429
+    assert state.calls == urls[:2]
+    assert {file: file.read_bytes() for file in files} == before
+    assert completion_rows(runner.cache) == []
+    assert runner.last_quality_result is None
+    state.statuses.clear()
+    runner.client = state.new_client()
+    original_json = runner.exporter.to_json
+
+    def export_after_all_pages(records, output_path):
+        assert state.calls == urls
+        assert len(records) == 3
+        assert completion_rows(runner.cache) == []
+        return original_json(records, output_path)
+
+    runner.exporter.to_json = export_after_all_pages
+    final = runner.run(path, output_dir)
+    assert state.calls == urls
+    assert final["records_extracted"] == 3
+    assert len(completion_rows(runner.cache)) == 1
+    print(f"{engine}: 3 successful fetches -> middle-page HTTP 429, all 5 old files unchanged, no completion -> 3-page rebuild completed")

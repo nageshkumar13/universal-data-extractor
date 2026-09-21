@@ -230,3 +230,173 @@ def test_browser_client_propagates_close_error_after_successful_fetch(
     page.content.assert_called_once_with()
     page.close.assert_called_once_with()
     assert resources.cleanup.mock_calls == [call.context(), call.browser(), call.playwright()]
+
+
+@pytest.mark.parametrize("status", [302, 307, 304, 403, 404, 429, 500, 503])
+def test_browser_failed_main_response_is_not_usable_html_regression(playwright_mock, status):
+    from requests import HTTPError
+
+    resources = playwright_mock
+    page = resources.context.new_page.side_effect()
+    resources.context.new_page.side_effect = None
+    resources.context.new_page.return_value = page
+    page.goto.return_value = SimpleNamespace(status=status, url="https://example.com/final")
+    page.content.return_value = "<article>HTTP error page</article>"
+
+    with pytest.raises(HTTPError):
+        with BrowserClient() as client:
+            client.fetch("https://example.com/requested")
+
+
+@pytest.mark.parametrize("status", [200, 201, 204, 206, 299])
+def test_browser_accepts_other_successful_main_statuses(playwright_mock, status):
+    page = playwright_mock.context.new_page.side_effect()
+    playwright_mock.context.new_page.side_effect = None
+    playwright_mock.context.new_page.return_value = page
+    page.goto.return_value = SimpleNamespace(status=status, url="https://example.com/final")
+    with BrowserClient() as client:
+        assert client.fetch("https://example.com/requested", wait_for="article") == page.content.return_value
+        assert client.last_status_code == status
+    page.wait_for_selector.assert_called_once_with("article")
+    page.content.assert_called_once_with()
+    page.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("status", [199, 302, 307, 304, 403, 404, 429, 500, 503, 600])
+def test_browser_failed_status_exposes_urls_and_never_reads_error_html(playwright_mock, status):
+    from core.http_client import HTTPStatusError
+
+    page = playwright_mock.context.new_page.side_effect()
+    playwright_mock.context.new_page.side_effect = None
+    playwright_mock.context.new_page.return_value = page
+    page.goto.return_value = SimpleNamespace(status=status, url="https://example.com/final")
+    with pytest.raises(HTTPStatusError) as caught:
+        with BrowserClient() as client:
+            client.fetch("https://example.com/requested", wait_for="article")
+    assert caught.value.status_code == status
+    assert caught.value.requested_url == "https://example.com/requested"
+    assert caught.value.final_url == "https://example.com/final"
+    assert str(caught.value) == f"Fetch failed with HTTP {status} for https://example.com/final"
+    page.wait_for_selector.assert_not_called()
+    page.content.assert_not_called()
+    page.close.assert_called_once_with()
+    assert playwright_mock.cleanup.mock_calls == [call.context(), call.browser(), call.playwright()]
+
+
+@pytest.mark.parametrize("final_status", [200, 206, 302, 307, 404, 503])
+def test_browser_navigation_uses_final_response_after_redirects(playwright_mock, final_status):
+    from core.http_client import HTTPStatusError
+
+    page = playwright_mock.context.new_page.side_effect()
+    playwright_mock.context.new_page.side_effect = None
+    playwright_mock.context.new_page.return_value = page
+    original_request = SimpleNamespace(url="https://example.com/requested", redirected_from=None)
+    intermediate = SimpleNamespace(url="https://example.com/intermediate", redirected_from=original_request)
+    final_request = SimpleNamespace(url="https://example.com/final", redirected_from=intermediate)
+    page.goto.return_value = SimpleNamespace(status=final_status, url=final_request.url, request=final_request)
+    with BrowserClient() as client:
+        if final_status < 300:
+            assert client.fetch(original_request.url) == page.content.return_value
+        else:
+            with pytest.raises(HTTPStatusError) as caught:
+                client.fetch(original_request.url)
+            assert caught.value.status_code == final_status
+            assert caught.value.requested_url == original_request.url
+            assert caught.value.final_url == final_request.url
+            page.content.assert_not_called()
+    page.goto.assert_called_once_with(original_request.url, wait_until="domcontentloaded")
+    page.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("failure", ["no_response", "status"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_browser_validation_failure_closes_every_resource_and_preserves_primary_error(
+    playwright_mock, scheme, failure, cleanup_fails, caplog,
+):
+    from core.http_client import HTTPStatusError
+
+    resources = playwright_mock
+    page = resources.context.new_page.side_effect()
+    resources.context.new_page.side_effect = None
+    resources.context.new_page.return_value = page
+    url = f"{scheme}://example.com/page"
+    page.goto.return_value = None if failure == "no_response" else SimpleNamespace(status=429, url=url)
+    if cleanup_fails:
+        page.close.side_effect = RuntimeError("page cleanup failed")
+        resources.context.close.side_effect = RuntimeError("context cleanup failed")
+        resources.browser.close.side_effect = RuntimeError("browser cleanup failed")
+        resources.playwright.stop.side_effect = RuntimeError("playwright cleanup failed")
+    error_type = RuntimeError if failure == "no_response" else HTTPStatusError
+    original_errors = []
+    with pytest.raises(error_type) as caught:
+        with BrowserClient() as client:
+            try:
+                client.fetch(url, wait_for="article")
+            except error_type as error:
+                original_errors.append(error)
+                raise
+    assert caught.value is original_errors[0]
+    if failure == "no_response":
+        assert str(caught.value) == f"Browser navigation returned no main-document response for {url}"
+        assert client.last_status_code is None
+    else:
+        assert caught.value.status_code == 429
+    page.wait_for_selector.assert_not_called()
+    page.content.assert_not_called()
+    page.close.assert_called_once_with()
+    assert resources.cleanup.mock_calls == [call.context(), call.browser(), call.playwright()]
+    client.close()
+    assert resources.cleanup.mock_calls == [call.context(), call.browser(), call.playwright()]
+    if cleanup_fails:
+        assert any(record.getMessage() == "Failed to close page while handling a fetch error" for record in caplog.records)
+        assert any(record.getMessage() == "Failed to clean up browser resources while handling an error" for record in caplog.records)
+
+
+@pytest.mark.parametrize("error_kind", ["timeout", "dns", "connection", "tls", "navigation", "interrupt"])
+def test_browser_transport_errors_keep_original_type_object_and_traceback(playwright_mock, error_kind):
+    import traceback
+    from playwright.sync_api import Error, TimeoutError
+
+    error_type = TimeoutError if error_kind == "timeout" else KeyboardInterrupt if error_kind == "interrupt" else Error
+    error = error_type(f"{error_kind} failed")
+    page = playwright_mock.context.new_page.side_effect()
+    playwright_mock.context.new_page.side_effect = None
+    playwright_mock.context.new_page.return_value = page
+    def fail_navigation(*args, **kwargs):
+        raise error
+    page.goto.side_effect = fail_navigation
+    with pytest.raises(error_type) as caught:
+        with BrowserClient() as client:
+            client.fetch("https://example.com")
+    assert caught.value is error
+    assert type(caught.value) is error_type
+    assert traceback.extract_tb(caught.value.__traceback__)[-1].name == "fail_navigation"
+    page.close.assert_called_once_with()
+    assert playwright_mock.cleanup.mock_calls == [call.context(), call.browser(), call.playwright()]
+
+
+def test_browser_ignores_secondary_404_when_main_document_succeeds(playwright_mock):
+    handlers = []
+    page = Mock(spec=["goto", "on", "wait_for_selector", "content", "close"])
+    page.on.side_effect = lambda event, callback: handlers.append((event, callback))
+    secondary = SimpleNamespace(status=404, url="https://example.com/image.png")
+    main = SimpleNamespace(status=200, url="https://example.com/page")
+    observed = []
+    def goto(*args, **kwargs):
+        for response in (main, secondary):
+            observed.append(response.status)
+            for event, callback in handlers:
+                if event == "response":
+                    callback(response)
+        return main
+    page.goto.side_effect = goto
+    page.content.return_value = "<article>Main content</article>"
+    playwright_mock.context.new_page.side_effect = None
+    playwright_mock.context.new_page.return_value = page
+    with BrowserClient() as client:
+        assert client.fetch(main.url) == "<article>Main content</article>"
+        assert client.last_status_code == 200
+    assert observed == [200, 404]
+    page.content.assert_called_once_with()
+    page.close.assert_called_once_with()
