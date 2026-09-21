@@ -115,6 +115,9 @@ class ScrapeRunner:
         )
         cache_only_run = pages_scraped == 0 and cached_skips > 0 and not transformed_records
 
+        if self.last_quality_result is not None and not cache_only_run:
+            self.exporter.write_quality_artifacts(self.last_quality_result, csv_path)
+
         if transformed_records:
             csv_path = self.exporter.to_csv(export_records, csv_path)
             json_path = self.exporter.to_json(export_records, json_path)

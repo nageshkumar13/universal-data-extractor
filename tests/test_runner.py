@@ -89,6 +89,9 @@ class FakeTransformer:
 
 
 class FakeExporter:
+    def write_quality_artifacts(self, result, output_path):
+        return runner_module.Exporter().write_quality_artifacts(result, output_path)
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, list[dict], Path]] = []
 
@@ -694,3 +697,256 @@ def test_exporter_failure_retains_completed_quality_result(
             getattr(runner.exporter, method).assert_called_once()
         else:
             getattr(runner.exporter, method).assert_not_called()
+
+
+
+def test_quality_audits_use_canonical_paths_same_result_and_precede_all_exports(
+    tmp_path, make_quality_runner, monkeypatch,
+):
+    from dataclasses import asdict
+    import core.exporter as exporter_module
+
+    first = "https://example.com/page-1.html"
+    second = "https://example.com/page-2.html"
+    runner, path = make_quality_runner(html_by_url={first: "first", second: "second"})
+    profile = runner.loader.load(path)
+    profile["site_name"] = "Client / Menu: 2026"
+    profile["fields"]["title"]["required"] = True
+    runner.loader = FakeLoader(profile)
+    records = {
+        first: [
+            {"id": "1", "title": "Caf\u00e9", "price": "12.50", "_source_url": first, "_page": 1},
+            {"id": "bad", "title": None, "price": "1.00", "_source_url": first, "_page": 1},
+        ],
+        second: [{"id": "1", "title": "Duplicate", "price": "15.00"}],
+    }
+    original_profile, original_records = deepcopy(profile), deepcopy(records)
+    runner.parser = FakeParser(records)
+    runner.paginator = FakePaginator({first: second, second: None})
+    runner.quality_processor.process = Mock(wraps=runner.quality_processor.process)
+    snapshots = []
+    original_write = runner.exporter.write_quality_artifacts
+
+    def write(result, output_path):
+        assert result is runner.last_quality_result
+        snapshots.append(deepcopy(result))
+        return original_write(result, output_path)
+
+    runner.exporter.write_quality_artifacts = Mock(side_effect=write)
+    dump = Mock(wraps=exporter_module.json.dump)
+    monkeypatch.setattr(exporter_module.json, "dump", dump)
+    output_dir = tmp_path / "client delivery"
+    quality_path = output_dir / "client_menu_2026.quality.json"
+    rejected_path = output_dir / "client_menu_2026.rejected.json"
+
+    def observe_export(method):
+        def export(clean_records, output_path):
+            result = runner.last_quality_result
+            assert clean_records is result.clean_records
+            assert json.loads(quality_path.read_text(encoding="utf-8")) == asdict(result.report)
+            assert json.loads(rejected_path.read_text(encoding="utf-8")) == result.rejected_records
+            return method(clean_records, output_path)
+        return export
+
+    for name in ("to_csv", "to_json", "to_excel"):
+        setattr(runner.exporter, name, observe_export(getattr(runner.exporter, name)))
+
+    summary = runner.run(path, output_dir)
+
+    result = runner.last_quality_result
+    runner.quality_processor.process.assert_called_once()
+    runner.exporter.write_quality_artifacts.assert_called_once_with(result, summary["csv_path"])
+    assert dump.call_count == 2
+    assert dump.call_args_list[1].args[0] is result.rejected_records
+    assert result == snapshots[0]
+    assert profile == original_profile
+    assert records == original_records
+    assert result.report.extracted == 3
+    assert result.report.rejected == result.report.duplicates_removed == result.report.exported == 1
+    assert len(result.rejected_records[0]["reasons"]) == 2
+    assert result.rejected_records[0]["_source_url"] == first
+    assert result.rejected_records[0]["_page"] == 1
+    assert set(output_dir.iterdir()) == {
+        summary["csv_path"], summary["json_path"], summary["xlsx_path"], quality_path, rejected_path,
+    }
+
+
+@pytest.mark.parametrize("case", ["no_rejections", "zero", "all_rejected"])
+@pytest.mark.parametrize("existing_normal_outputs", [False, True])
+def test_quality_audits_exist_for_empty_and_nonempty_completed_runs(
+    tmp_path, make_quality_runner, case, existing_normal_outputs,
+):
+    from dataclasses import asdict
+
+    runner, path = make_quality_runner()
+    records = {
+        "no_rejections": [{"id": "1", "title": "One", "price": "1.0"}],
+        "zero": [],
+        "all_rejected": [{"id": "invalid", "title": "Rejected", "price": "1.0"}],
+    }[case]
+    runner.parser = FakeParser({"https://example.com/page-1.html": records})
+    if existing_normal_outputs:
+        for extension in ("csv", "json", "xlsx"):
+            (tmp_path / f"quality_example.{extension}").write_text("previous", encoding="utf-8")
+
+    runner.run(path, tmp_path)
+
+    result = runner.last_quality_result
+    report = json.loads((tmp_path / "quality_example.quality.json").read_text(encoding="utf-8"))
+    rejected = json.loads((tmp_path / "quality_example.rejected.json").read_text(encoding="utf-8"))
+    assert report == asdict(result.report)
+    assert rejected == result.rejected_records
+    if case == "zero":
+        assert all(value == 0 for value in report.values())
+        assert rejected == []
+        if existing_normal_outputs:
+            assert runner.exporter.calls == []
+        else:
+            assert len(runner.exporter.calls) == 3
+            assert all(call[1] == [] for call in runner.exporter.calls)
+    elif case == "all_rejected":
+        assert report["rejected"] == len(rejected) == 1
+        assert report["exported"] == 0
+        assert len(runner.exporter.calls) == 3
+        assert all(call[1] == [] for call in runner.exporter.calls)
+    else:
+        assert rejected == []
+        assert report["exported"] == 1
+
+
+@pytest.mark.parametrize("quality", [None, False])
+@pytest.mark.parametrize("existing", [False, True])
+def test_legacy_runs_never_touch_quality_artifacts(tmp_path, make_quality_runner, quality, existing):
+    runner, path = make_quality_runner(quality=quality)
+    targets = [tmp_path / f"quality_example.{kind}.json" for kind in ("quality", "rejected")]
+    if existing:
+        for target in targets:
+            target.write_bytes(b'{"previous": true}')
+    runner.exporter.write_quality_artifacts = Mock(side_effect=AssertionError("Audit must not run"))
+
+    runner.run(path, tmp_path)
+
+    runner.exporter.write_quality_artifacts.assert_not_called()
+    assert runner.last_quality_result is None
+    for target in targets:
+        if existing:
+            assert target.read_bytes() == b'{"previous": true}'
+        else:
+            assert not target.exists()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_cache_only_runs_never_create_or_overwrite_quality_artifacts(
+    tmp_path, make_quality_runner, existing,
+):
+    runner, path = make_quality_runner()
+    targets = [tmp_path / f"quality_example.{kind}.json" for kind in ("quality", "rejected")]
+    if existing:
+        runner.parser = FakeParser({
+            "https://example.com/page-1.html": [{"id": "bad", "title": "Rejected", "price": "1.0"}],
+        })
+        runner.run(path, tmp_path)
+        previous = [target.read_bytes() for target in targets]
+        assert runner.last_quality_result.report.rejected == 1
+    profile = runner.loader.load(path)
+    profile.pop("pagination")
+    runner.loader = FakeLoader(profile)
+    runner.cache = FakeCache({profile["start_url"]})
+    runner.client = FakeClient({})
+    runner.exporter.calls.clear()
+    runner.exporter.write_quality_artifacts = Mock(side_effect=AssertionError("Audit must not run"))
+
+    summary = runner.run(path, tmp_path)
+
+    assert summary["cache_only_run"] is True
+    assert runner.last_quality_result.report.extracted == 0
+    assert runner.exporter.calls == []
+    runner.exporter.write_quality_artifacts.assert_not_called()
+    if existing:
+        assert [target.read_bytes() for target in targets] == previous
+    else:
+        assert all(not target.exists() for target in targets)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_quality_failure_writes_no_audits_or_data(tmp_path, make_quality_runner, existing):
+    runner, path = make_quality_runner()
+    targets = [tmp_path / f"quality_example.{kind}.json" for kind in ("quality", "rejected")]
+    if existing:
+        for target in targets:
+            target.write_text("[]", encoding="utf-8")
+    error = RuntimeError("quality failed")
+    runner.quality_processor.process = Mock(side_effect=error)
+    runner.exporter.write_quality_artifacts = Mock(side_effect=AssertionError("Audit must not run"))
+
+    with pytest.raises(RuntimeError) as caught:
+        runner.run(path, tmp_path)
+
+    assert caught.value is error
+    assert runner.last_quality_result is None
+    runner.exporter.write_quality_artifacts.assert_not_called()
+    assert runner.exporter.calls == []
+    for target in targets:
+        if existing:
+            assert target.read_text(encoding="utf-8") == "[]"
+        else:
+            assert not target.exists()
+
+
+@pytest.mark.parametrize("failed_write", [1, 2])
+def test_audit_write_failure_preserves_target_and_prevents_normal_export(
+    tmp_path, make_quality_runner, monkeypatch, failed_write,
+):
+    import core.exporter as exporter_module
+
+    runner, path = make_quality_runner()
+    targets = [tmp_path / f"quality_example.{kind}.json" for kind in ("quality", "rejected")]
+    for target in targets:
+        target.write_text('["previous"]', encoding="utf-8")
+    previous = [target.read_bytes() for target in targets]
+    original_dump = exporter_module.json.dump
+    calls = []
+    error = OSError("partial audit write failed")
+
+    def dump(data, handle, **kwargs):
+        calls.append(handle.name)
+        if len(calls) == failed_write:
+            handle.write('{"partial":')
+            raise error
+        return original_dump(data, handle, **kwargs)
+
+    monkeypatch.setattr(exporter_module.json, "dump", dump)
+
+    with pytest.raises(OSError) as caught:
+        runner.run(path, tmp_path)
+
+    assert caught.value is error
+    assert runner.last_quality_result is not None
+    assert len(calls) == failed_write
+    assert runner.exporter.calls == []
+    assert targets[failed_write - 1].read_bytes() == previous[failed_write - 1]
+    if failed_write == 1:
+        assert targets[1].read_bytes() == previous[1]
+    assert not list(tmp_path.glob("*.tmp"))
+    assert all(not (tmp_path / f"quality_example.{extension}").exists() for extension in ("csv", "json", "xlsx"))
+
+
+@pytest.mark.parametrize("method", ["to_csv", "to_json", "to_excel"])
+def test_normal_export_failure_keeps_successful_audits(tmp_path, make_quality_runner, method):
+    from dataclasses import asdict
+
+    runner, path = make_quality_runner()
+    error = OSError("normal export failed")
+    setattr(runner.exporter, method, Mock(side_effect=error))
+    runner.exporter.write_quality_artifacts = Mock(wraps=runner.exporter.write_quality_artifacts)
+
+    with pytest.raises(OSError) as caught:
+        runner.run(path, tmp_path)
+
+    assert caught.value is error
+    result = runner.last_quality_result
+    assert result is not None
+    runner.exporter.write_quality_artifacts.assert_called_once()
+    assert runner.exporter.write_quality_artifacts.call_args.args[0] is result
+    assert json.loads((tmp_path / "quality_example.quality.json").read_text(encoding="utf-8")) == asdict(result.report)
+    assert json.loads((tmp_path / "quality_example.rejected.json").read_text(encoding="utf-8")) == result.rejected_records
