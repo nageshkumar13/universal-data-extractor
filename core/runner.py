@@ -8,6 +8,7 @@ from core.config import ProfileLoader
 from core.exporter import Exporter
 from core.pagination import Paginator
 from core.parser import HTMLParser
+from core.quality import QualityProcessor, QualityResult
 from core.robots import RobotsChecker
 from core.transformers import Transformer
 
@@ -21,6 +22,8 @@ class ScrapeRunner:
         self.cache = URLCache()
         self.transformer = Transformer()
         self.exporter = Exporter()
+        self.quality_processor = QualityProcessor()
+        self.last_quality_result: QualityResult | None = None
 
     def run(
         self,
@@ -28,7 +31,15 @@ class ScrapeRunner:
         output_dir: Path,
         clear_cache: bool = False,
     ) -> dict[str, Any]:
+        self.last_quality_result = None
         profile = self.loader.load(profile_path)
+        quality_enabled = profile.get("data_quality") is True
+        parser_fields = profile["fields"]
+        if quality_enabled:
+            parser_fields = {
+                name: definition["selector"]
+                for name, definition in profile["fields"].items()
+            }
         client = self.client if self.client is not None else create_client(profile["engine"])
         robots = RobotsChecker(profile["start_url"])
 
@@ -79,7 +90,7 @@ class ScrapeRunner:
                     request_count,
                     profile.get("wait_for"),
                 )
-                records = self.parser.extract(html, profile["fields"], current_url)
+                records = self.parser.extract(html, parser_fields, current_url)
                 all_records.extend(records)
                 self.cache.mark_done(current_url, len(records))
 
@@ -92,6 +103,12 @@ class ScrapeRunner:
                 processed_pages += 1
 
         transformed_records = self.transformer.transform(all_records)
+        export_records = transformed_records
+        if quality_enabled:
+            self.last_quality_result = self.quality_processor.process(
+                transformed_records, profile,
+            )
+            export_records = self.last_quality_result.clean_records
         csv_path, json_path, xlsx_path = self._build_output_paths(
             profile["site_name"],
             output_dir,
@@ -99,15 +116,15 @@ class ScrapeRunner:
         cache_only_run = pages_scraped == 0 and cached_skips > 0 and not transformed_records
 
         if transformed_records:
-            csv_path = self.exporter.to_csv(transformed_records, csv_path)
-            json_path = self.exporter.to_json(transformed_records, json_path)
-            xlsx_path = self.exporter.to_excel(transformed_records, xlsx_path)
+            csv_path = self.exporter.to_csv(export_records, csv_path)
+            json_path = self.exporter.to_json(export_records, json_path)
+            xlsx_path = self.exporter.to_excel(export_records, xlsx_path)
         elif not cache_only_run and (
             not csv_path.exists() or not json_path.exists() or not xlsx_path.exists()
         ):
-            csv_path = self.exporter.to_csv(transformed_records, csv_path)
-            json_path = self.exporter.to_json(transformed_records, json_path)
-            xlsx_path = self.exporter.to_excel(transformed_records, xlsx_path)
+            csv_path = self.exporter.to_csv(export_records, csv_path)
+            json_path = self.exporter.to_json(export_records, json_path)
+            xlsx_path = self.exporter.to_excel(export_records, xlsx_path)
 
         return {
             "site_name": profile["site_name"],
