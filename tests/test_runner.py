@@ -2239,3 +2239,65 @@ def test_record_selector_alone_invalidates_completion_and_a_b_a_ownership(make_c
     assert identities[0][0] == identities[1][0] == identities[2][0]
     assert identities[0][1] != identities[1][1]
     assert identities[0] == identities[2]
+
+
+
+@pytest.mark.parametrize("zero", [False, True])
+def test_quality_enabled_state_tracks_fresh_skip_disabled_and_failed_loading(make_completion_runner, zero):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    assert runner.last_quality_enabled is False
+    with pytest.raises(AttributeError):
+        runner.last_quality_enabled = True
+    if zero:
+        profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+        profile["record_selector"] = ".absent"
+        path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    result = runner.run(path, output_dir)
+    assert runner.last_quality_enabled is True
+    assert runner.last_quality_result is not None
+    assert set(result) == {"site_name", "pages_scraped", "records_extracted", "records_transformed",
+                           "cached_skips", "robots_blocked", "cache_only_run", "csv_path", "json_path", "xlsx_path"}
+    runner.client = FakeClient({})
+    assert runner.run(path, output_dir)["cache_only_run"] is True
+    assert runner.last_quality_enabled is True
+    assert runner.last_quality_result is None
+    profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile["data_quality"] = False
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.client = FakeClient({url: '<article><h2>Title</h2></article>' for url in urls})
+    runner.run(path, output_dir)
+    assert runner.last_quality_enabled is False
+    assert runner.last_quality_result is None
+    profile["data_quality"] = True
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    runner.client = FakeClient(runner.client.html_by_url)
+    runner.run(path, output_dir)
+    assert runner.last_quality_enabled is True
+    assert runner.last_quality_result is not None
+    error = ValueError("Invalid profile")
+
+    def fail_load(profile_path):
+        assert runner.last_quality_enabled is False
+        assert runner.last_quality_result is None
+        raise error
+
+    runner.loader.load = fail_load
+    with pytest.raises(ValueError) as caught:
+        runner.run(path, output_dir)
+    assert caught.value is error
+    assert runner.last_quality_enabled is False
+
+
+def test_quality_enabled_state_comes_from_single_validated_snapshot_on_fetch_failure(make_completion_runner):
+    runner, path, output_dir, urls = make_completion_runner(quality=True)
+    profile = runner.loader.load(path)
+    runner.loader.load = Mock(return_value=profile)
+    error = RuntimeError("Fetch failed")
+    runner.client.fetch = Mock(side_effect=error)
+    with pytest.raises(RuntimeError) as caught:
+        runner.run(path, output_dir)
+    assert caught.value is error
+    runner.loader.load.assert_called_once_with(path)
+    assert runner.last_quality_enabled is True
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == []

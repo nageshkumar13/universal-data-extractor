@@ -17,6 +17,11 @@ except ImportError:
     pd = None
 
 
+def quality_artifact_paths(output_path: Path) -> tuple[Path, Path]:
+    """Derive audit paths from the normal export path without filesystem access."""
+    return output_path.with_suffix(".quality.json"), output_path.with_suffix(".rejected.json")
+
+
 class Exporter:
     def to_csv(self, records: list[dict], output_path: Path) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,8 +92,7 @@ class Exporter:
         Each file is atomic independently; a failed second write leaves the
         successfully replaced report and the previous rejected file intact.
         """
-        quality_path = output_path.with_suffix(".quality.json")
-        rejected_path = output_path.with_suffix(".rejected.json")
+        quality_path, rejected_path = quality_artifact_paths(output_path)
         self._write_audit_json(asdict(result.report), quality_path)
         self._write_audit_json(result.rejected_records, rejected_path)
         return quality_path, rejected_path

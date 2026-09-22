@@ -249,3 +249,41 @@ def test_audit_paths_preserve_dotted_parents_and_stems_without_touching_normal_e
     )
     assert all(path.read_bytes() == b"existing normal export" for path in normal_paths)
     assert set(directory.iterdir()) == set(normal_paths + list(paths))
+
+
+
+@pytest.mark.parametrize("name", ["menu.csv", "client exports/caf\u00e9 menu.v1.csv"])
+def test_quality_path_helper_is_pure_and_preserves_names(tmp_path, monkeypatch, name):
+    from unittest.mock import Mock
+    from core.exporter import quality_artifact_paths
+
+    anchor = tmp_path / name
+    expected = (anchor.parent / (anchor.stem + ".quality.json"),
+                anchor.parent / (anchor.stem + ".rejected.json"))
+    before = list(tmp_path.rglob("*"))
+    with monkeypatch.context() as patch:
+        for method in ("open", "mkdir", "exists", "stat", "resolve"):
+            patch.setattr(Path, method, Mock(side_effect=AssertionError("Helper must not access filesystem")))
+        assert quality_artifact_paths(anchor) == expected
+        assert quality_artifact_paths(anchor) == expected
+    assert list(tmp_path.rglob("*")) == before
+
+
+def test_audit_writer_uses_pure_path_api_without_changing_bytes(tmp_path, audit_result, monkeypatch):
+    from unittest.mock import Mock
+
+    anchor = tmp_path / "client exports" / "caf\u00e9 menu.csv"
+    expected_paths = exporter_module.quality_artifact_paths(anchor)
+    derive = Mock(wraps=exporter_module.quality_artifact_paths)
+    monkeypatch.setattr(exporter_module, "quality_artifact_paths", derive)
+    original = deepcopy(audit_result)
+    paths = Exporter().write_quality_artifacts(audit_result, anchor)
+    derive.assert_called_once_with(anchor)
+    assert paths == expected_paths
+    for path, data in zip(paths, (asdict(audit_result.report), audit_result.rejected_records)):
+        expected = (json.dumps(data, indent=4, ensure_ascii=False, allow_nan=False) + "\n").replace("\n", os.linesep)
+        assert path.read_bytes() == expected.encode("utf-8")
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+    assert exporter_module.quality_artifact_paths(anchor) == paths
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths} == before
+    assert audit_result == original

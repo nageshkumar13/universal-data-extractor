@@ -5,7 +5,7 @@ import time
 from core.cache import URLCache, run_identity
 from core.client_factory import PageClient, create_client
 from core.config import ProfileLoader
-from core.exporter import Exporter
+from core.exporter import Exporter, quality_artifact_paths
 from core.pagination import Paginator
 from core.parser import HTMLParser
 from core.quality import QualityProcessor, QualityResult
@@ -24,6 +24,12 @@ class ScrapeRunner:
         self.exporter = Exporter()
         self.quality_processor = QualityProcessor()
         self.last_quality_result: QualityResult | None = None
+        self._last_quality_enabled = False
+
+    @property
+    def last_quality_enabled(self) -> bool:
+        """Whether the most recent run's validated profile enabled quality."""
+        return self._last_quality_enabled
 
     def run(
         self,
@@ -32,8 +38,10 @@ class ScrapeRunner:
         clear_cache: bool = False,
     ) -> dict[str, Any]:
         self.last_quality_result = None
+        self._last_quality_enabled = False
         profile = self.loader.load(profile_path)
         quality_enabled = profile.get("data_quality") is True
+        self._last_quality_enabled = quality_enabled
         parser_fields = profile["fields"]
         if quality_enabled:
             parser_fields = {
@@ -43,9 +51,7 @@ class ScrapeRunner:
         csv_path, json_path, xlsx_path = self._build_output_paths(profile["site_name"], output_dir)
         expected_outputs = [csv_path, json_path, xlsx_path]
         if quality_enabled:
-            expected_outputs.extend([
-                csv_path.with_suffix(".quality.json"), csv_path.with_suffix(".rejected.json"),
-            ])
+            expected_outputs.extend(quality_artifact_paths(csv_path))
         output_key, fingerprint = run_identity(profile, csv_path)
         if clear_cache:
             self.cache.clear()
