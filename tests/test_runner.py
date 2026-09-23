@@ -1779,14 +1779,19 @@ def make_status_runner(make_completion_runner, monkeypatch):
         profile["engine"] = engine
         path.write_text(yaml.safe_dump(profile), encoding="utf-8")
         pages = dict(runner.client.html_by_url)
-        state = SimpleNamespace(statuses={}, calls=[], pages=[], sessions=[], cleanups=[])
+        state = SimpleNamespace(statuses={}, calls=[], pages=[], sessions=[], cleanups=[], sleeps=[])
+
+        def next_status(url):
+            value = state.statuses.get(url, 200)
+            return value.pop(0) if isinstance(value, list) else value
 
         def new_client():
             state.calls = []
             state.pages = []
             state.cleanups = []
+            state.sleeps = []
             if engine == "static":
-                client = HttpClient()
+                client = HttpClient(sleep=state.sleeps.append)
                 original_close = client.session.close
                 client.session.close = Mock(wraps=original_close)
                 state.sessions.append(client.session)
@@ -1794,10 +1799,11 @@ def make_status_runner(make_completion_runner, monkeypatch):
                 def get(url, **kwargs):
                     state.calls.append(url)
                     response = Response()
-                    response.status_code = state.statuses.get(url, 200)
+                    response.status_code = next_status(url)
                     response.url = url
                     html = pages[url] if response.status_code < 300 else "<article><h2>HTTP error page</h2></article>"
                     response._content = html.encode("utf-8")
+                    response._content_consumed = True
                     return response
 
                 monkeypatch.setattr(client.session, "get", Mock(side_effect=get))
@@ -1818,9 +1824,9 @@ def make_status_runner(make_completion_runner, monkeypatch):
 
                 def goto(url, **kwargs):
                     state.calls.append(url)
-                    status = state.statuses.get(url, 200)
+                    status = next_status(url)
                     page.content.return_value = pages[url] if status < 300 else "<article><h2>HTTP error page</h2></article>"
-                    return SimpleNamespace(status=status, url=url)
+                    return SimpleNamespace(status=status, url=url, headers={})
 
                 page.goto.side_effect = goto
                 state.pages.append(page)
@@ -1828,7 +1834,7 @@ def make_status_runner(make_completion_runner, monkeypatch):
 
             context.new_page.side_effect = new_page
             monkeypatch.setattr(browser_module, "sync_playwright", lambda: manager)
-            return BrowserClient()
+            return BrowserClient(sleep=state.sleeps.append)
 
         state.new_client = new_client
         runner.client = new_client()
@@ -1902,7 +1908,8 @@ def test_status_failure_preserves_all_outputs_and_next_run_rebuilds_from_start(
     assert caught.value is original_errors[0]
     assert caught.value.status_code == 429
     assert caught.value.requested_url == caught.value.final_url == urls[failed_index]
-    assert state.calls == urls[:failed_index + 1]
+    assert state.calls == urls[:failed_index] + [urls[failed_index]] * 4
+    assert state.sleeps == [1, 2, 4]
     assert runner.parser.extract.call_count == failed_index
     assert all("HTTP error page" not in call.args[0] for call in runner.parser.extract.call_args_list)
     runner.transformer.transform.assert_not_called()
@@ -1918,7 +1925,7 @@ def test_status_failure_preserves_all_outputs_and_next_run_rebuilds_from_start(
         assert runner.cache.completed_pages(old_rows[0][0], old_rows[0][1]) is None
     if engine == "browser":
         assert state.cleanups == ["context", "browser", "playwright"]
-        assert len(state.pages) == failed_index + 1
+        assert len(state.pages) == failed_index + 4
         for page in state.pages:
             page.close.assert_called_once_with()
         state.pages[-1].content.assert_not_called()
@@ -1974,7 +1981,8 @@ def test_http_failure_recovery_demonstration(make_status_runner, engine):
     with pytest.raises(HTTPStatusError) as caught:
         runner.run(path, output_dir)
     assert caught.value.status_code == 429
-    assert state.calls == urls[:2]
+    assert state.calls == [urls[0]] + [urls[1]] * 4
+    assert state.sleeps == [1, 2, 4]
     assert {file: file.read_bytes() for file in files} == before
     assert completion_rows(runner.cache) == []
     assert runner.last_quality_result is None
@@ -2301,3 +2309,91 @@ def test_quality_enabled_state_comes_from_single_validated_snapshot_on_fetch_fai
     assert runner.last_quality_enabled is True
     assert runner.last_quality_result is None
     assert completion_rows(runner.cache) == []
+
+
+@pytest.mark.parametrize("engine", ["static", "browser"])
+def test_recovered_status_attempts_do_not_repeat_pipeline_or_robots(make_status_runner, monkeypatch, engine):
+    runner, path, output_dir, urls, state = make_status_runner(engine)
+    state.statuses[urls[1]] = [429, 503, 200]
+    robots = Mock()
+    robots.is_allowed.return_value = True
+    monkeypatch.setattr(runner_module, "RobotsChecker", Mock(return_value=robots))
+    runner.parser.extract = Mock(wraps=runner.parser.extract)
+    runner.transformer.transform = Mock(wraps=runner.transformer.transform)
+    runner.quality_processor.process = Mock(wraps=runner.quality_processor.process)
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        setattr(runner.exporter, method, Mock(wraps=getattr(runner.exporter, method)))
+    result = runner.run(path, output_dir)
+    assert state.calls == [urls[0]] + [urls[1]] * 3 + [urls[2]]
+    assert state.sleeps == [1, 2]
+    assert [call.args[0] for call in robots.is_allowed.call_args_list] == urls
+    assert runner.parser.extract.call_count == 3
+    assert all("HTTP error page" not in call.args[0] for call in runner.parser.extract.call_args_list)
+    runner.transformer.transform.assert_called_once()
+    runner.quality_processor.process.assert_called_once()
+    for method in ("to_csv", "to_json", "to_excel", "write_quality_artifacts"):
+        getattr(runner.exporter, method).assert_called_once()
+    assert result["pages_scraped"] == result["records_extracted"] == result["records_transformed"] == 3
+    assert len(completion_rows(runner.cache)) == 1
+    assert all(file.is_file() for file in expected_run_paths(result, True))
+    before = {file: file.read_bytes() for file in expected_run_paths(result, True)}
+    rows = completion_rows(runner.cache)
+    state.calls.clear()
+    state.sleeps.clear()
+    skipped = runner.run(path, output_dir)
+    assert skipped["cache_only_run"] is True
+    assert state.calls == state.sleeps == []
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == rows
+    assert {file: file.read_bytes() for file in before} == before
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_browser_retry_page_close_failure_cannot_export_or_complete(make_status_runner, monkeypatch, recovery):
+    from core.browser_client import BrowserClient
+    from core.http_client import HTTPStatusError
+
+    runner, path, output_dir, urls, state = make_status_runner("browser")
+    before = {}
+    if recovery:
+        completed = runner.run(path, output_dir)
+        before = {file: file.read_bytes() for file in expected_run_paths(completed, True)}
+        profile = yaml.safe_load(path.read_text(encoding="utf-8"))
+        profile["max_pages"] = 4
+        path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+        runner.client = state.new_client()
+    state.statuses[urls[0]] = 503
+    close_error = RuntimeError("cannot close retry page")
+    enter = BrowserClient.__enter__
+
+    def enter_with_failed_page_close(client):
+        opened = enter(client)
+        create = client._context.new_page.side_effect
+        def new_page():
+            page = create()
+            page.close.side_effect = close_error
+            return page
+        client._context.new_page.side_effect = new_page
+        return opened
+
+    monkeypatch.setattr(BrowserClient, "__enter__", enter_with_failed_page_close)
+    for target, methods in (
+        (runner.parser, ("extract",)), (runner.transformer, ("transform",)),
+        (runner.quality_processor, ("process",)),
+        (runner.exporter, ("to_csv", "to_json", "to_excel", "write_quality_artifacts")),
+        (runner.cache, ("mark_complete",)),
+    ):
+        for method in methods:
+            setattr(target, method, Mock(side_effect=AssertionError("No processing after cleanup failure")))
+    with pytest.raises(HTTPStatusError) as caught:
+        runner.run(path, output_dir)
+    assert caught.value.status_code == 503
+    assert caught.value.requested_url == caught.value.final_url == urls[0]
+    assert state.calls == [urls[0]]
+    assert state.sleeps == []
+    assert len(state.pages) == 1
+    state.pages[0].close.assert_called_once_with()
+    assert state.cleanups == ["context", "browser", "playwright"]
+    assert runner.last_quality_result is None
+    assert completion_rows(runner.cache) == []
+    assert {file: file.read_bytes() for file in output_dir.glob("*")} == before
