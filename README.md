@@ -2,7 +2,7 @@
 
 Turn public website listings into CSV, JSON and Excel deliverables using reusable YAML profiles. Choose Requests for static HTML or Playwright for JavaScript-rendered content, with optional validation, duplicate handling and rejection evidence.
 
-**Status:** both engines have been verified end to end on Windows with Python 3.12. The deterministic CI workflow is prepared for Ubuntu Python 3.11/3.12 and Windows Python 3.12; hosted execution remains pending. macOS has not been verified.
+**Status:** both engines have been manually verified end to end on Windows with Python 3.12. Hosted GitHub Actions passed on Ubuntu with Python 3.11/3.12 and Windows with Python 3.12. CI installs and launches Chromium against local in-memory HTML; live Books and Quotes scraping was verified manually during the release audit. macOS has not been verified.
 
 ## Capabilities
 
@@ -46,7 +46,7 @@ All pages accumulate before transformation and quality processing. The client cl
 
 ## Installation
 
-Use Python **3.11 or 3.12**, the CI targets. Python 3.12 on Windows is manually verified; Python 3.11 compatibility has been checked against syntax and declared dependencies, with runtime verification pending CI.
+Use Python **3.11 or 3.12**, verified by hosted CI on Ubuntu; Windows Python 3.12 also passed hosted CI and was manually verified with real static and browser demonstrations.
 
 From the repository root, create and activate a virtual environment.
 
@@ -188,7 +188,7 @@ Requests retains separate transport retries. Redirects, those retries and browse
 python -m pytest -q
 ```
 
-The deterministic suite uses fakes rather than live websites. [CI](.github/workflows/ci.yml) targets Ubuntu 3.11/3.12 and Windows 3.12, installs declared dependencies and Chromium, checks dependency compatibility, launches Chromium against in-memory HTML, then runs pytest. It requires no site credentials or live scraping. The workflow is **prepared, not yet executed** on GitHub for this change.
+The deterministic suite uses fakes rather than live websites. [CI](.github/workflows/ci.yml) passed on Ubuntu 3.11/3.12 and Windows 3.12, installing declared dependencies and Chromium, checking dependency compatibility, launching Chromium against in-memory HTML, then running pytest. Normal CI deliberately does not scrape third-party websites and requires no site credentials. The live Books and Quotes results above came from manual release validation; external availability and DOM structure can change.
 
 ## Limitations and responsible use
 
