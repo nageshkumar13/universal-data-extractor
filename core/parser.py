@@ -6,10 +6,13 @@ from core.url_utils import normalize_url
 
 class HTMLParser:
     def extract(
-        self, html: str, fields: dict[str, str], base_url: str
+        self, html: str, fields: dict[str, str], base_url: str,
+        record_selector: str | None = None,
     ) -> list[dict[str, str]]:
         soup = self._build_soup(html)
-        record_selector = self._infer_record_selector(soup, fields)
+        explicit_record_selector = record_selector is not None
+        if not explicit_record_selector:
+            record_selector = self._infer_record_selector(soup, fields)
         records: list[dict[str, str]] = []
 
         for element in soup.select(record_selector):
@@ -17,8 +20,12 @@ class HTMLParser:
 
             for field_name, selector in fields.items():
                 css_selector, extract_type, attribute_name = self._parse_selector(selector)
-                relative_selector = self._make_relative_selector(css_selector, record_selector)
-                target = element if not relative_selector else element.select_one(relative_selector)
+                if explicit_record_selector:
+                    # Keep complete CSS intact; only exact equality selects self.
+                    target = element if css_selector == record_selector else element.select_one(css_selector)
+                else:
+                    relative_selector = self._make_relative_selector(css_selector, record_selector)
+                    target = element if not relative_selector else element.select_one(relative_selector)
 
                 if target is None:
                     value = ""

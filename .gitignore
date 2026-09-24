@@ -218,4 +218,10 @@ __marimo__/
 .streamlit/secrets.toml
 data/cache.db
 
+# Generated exports (existing tracked samples remain versioned)
+data/*.csv
+data/*.json
 data/*.xlsx
+
+# Local patch transfer files
+/*.patch

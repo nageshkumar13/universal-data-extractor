@@ -1,6 +1,11 @@
 import csv
+from dataclasses import asdict
+from datetime import date
 import json
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from core.quality import QualityResult
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -10,6 +15,11 @@ try:
     import pandas as pd
 except ImportError:
     pd = None
+
+
+def quality_artifact_paths(output_path: Path) -> tuple[Path, Path]:
+    """Derive audit paths from the normal export path without filesystem access."""
+    return output_path.with_suffix(".quality.json"), output_path.with_suffix(".rejected.json")
 
 
 class Exporter:
@@ -73,3 +83,56 @@ class Exporter:
 
         workbook.save(output_path)
         return output_path
+
+    def write_quality_artifacts(
+        self, result: QualityResult, output_path: Path
+    ) -> tuple[Path, Path]:
+        """Write audit sidecars using an existing normal export path as the anchor.
+
+        Each file is atomic independently; a failed second write leaves the
+        successfully replaced report and the previous rejected file intact.
+        """
+        quality_path, rejected_path = quality_artifact_paths(output_path)
+        self._write_audit_json(asdict(result.report), quality_path)
+        self._write_audit_json(result.rejected_records, rejected_path)
+        return quality_path, rejected_path
+
+    @staticmethod
+    def _write_audit_json(data: object, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            file_handle = NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=output_path.parent,
+                prefix=f".{output_path.name}.", suffix=".tmp", delete=False,
+            )
+            temporary_path = Path(file_handle.name)
+            try:
+                json.dump(
+                    data, file_handle, indent=4, ensure_ascii=False,
+                    allow_nan=False, default=Exporter._audit_json_default,
+                )
+                file_handle.write("\n")
+            except BaseException:
+                try:
+                    file_handle.close()
+                except BaseException:
+                    # Preserve the original write/interruption error.
+                    pass
+                raise
+            file_handle.close()
+            temporary_path.replace(output_path)
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    # Best effort only: never mask the write/replace exception.
+                    pass
+
+    @staticmethod
+    def _audit_json_default(value: object) -> str:
+        # Raw rejected values may contain native dates accepted by the processor.
+        if isinstance(value, date):
+            return value.isoformat()
+        raise TypeError(f"Unsupported audit JSON value: {type(value).__name__}")
