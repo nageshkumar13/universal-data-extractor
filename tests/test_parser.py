@@ -1,9 +1,12 @@
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 from soupsieve import SelectorSyntaxError
 
+from core.cache import URLCache, run_identity
 from core.config import ProfileLoader
+from core.pagination import Paginator
 from core.parser import HTMLParser
 
 POUND = "\u00a3"
@@ -185,8 +188,8 @@ LEGACY_PROFILE_CASES = [
       {"title": "Book Two", "price": "\u00a320.00", "rating": "star-rating Two", "availability": "Available", "product_url": "https://books.toscrape.com/catalogue/two"}]),
     ("jobs.yaml", ''.join(f'<div class="card-content"><h2 class="title is-5">Job {i}</h2><h3 class="subtitle is-6 company">Company {i}</h3><p class="location"> Town {i} </p><time datetime="2026-01-0{i}"></time><a class="card-footer-item" href="job-{i}">Apply</a></div>' for i in (1, 2)),
      [{"title": f"Job {i}", "company": f"Company {i}", "location": f"Town {i}", "date_posted": f"2026-01-0{i}", "apply_url": f"https://realpython.github.io/fake-jobs/job-{i}"} for i in (1, 2)]),
-    ("quotes_js.yaml", ''.join(f'<div class="quote"><span class="text"> Quote {i} </span><small class="author">Author {i}</small><a href="/author/{i}">About</a></div>' for i in (1, 2)),
-     [{"quote": f"Quote {i}", "author": f"Author {i}", "author_url": f"https://quotes.toscrape.com/author/{i}"} for i in (1, 2)]),
+    ("quotes_js.yaml", ''.join(f'<div class="quote"><span class="text"> Quote {i} </span><span>by <small class="author">Author {i}</small></span><div class="tags">Tags: <a class="tag">tag-{i}</a></div></div>' for i in (1, 2)),
+     [{"quote": f"Quote {i}", "author": f"Author {i}"} for i in (1, 2)]),
 ]
 
 
@@ -232,3 +235,60 @@ def test_empty_css_is_not_an_implicit_self_selector(field):
     with pytest.raises(SelectorSyntaxError):
         HTMLParser().extract('<article id="own">Text</article>', {"value": field},
                              "https://example.com", "article")
+
+
+def test_quotes_profile_extracts_only_available_fields_and_preserves_settings():
+    profile = ProfileLoader().load(Path(__file__).resolve().parents[1] / "profiles/quotes_js.yaml")
+    assert profile == {
+        "site_name": "Quotes JavaScript",
+        "engine": "browser",
+        "start_url": "https://quotes.toscrape.com/js/",
+        "wait_for": "div.quote",
+        "max_pages": 3,
+        "delay": 1.0,
+        "fields": {
+            "quote": "div.quote span.text::text",
+            "author": "div.quote small.author::text",
+        },
+        "pagination": {"next_button": "li.next a"},
+    }
+    assert list(profile["fields"]) == ["quote", "author"]
+    html = """
+        <header><a href="/outside">Outside</a>
+          <span class="text">Outside quote</span><small class="author">Outside author</small>
+        </header>
+        <div class="quote"><span class="text"> First   quote </span>
+          <span>by <small class="author">First Author</small></span>
+          <div class="tags">Tags: <a class="tag">first-tag</a></div>
+        </div>
+        <div class="quote"><span class="text">Second quote</span>
+          <span>by <small class="author">Second Author</small></span>
+          <div class="tags">Tags: <a class="tag">second-tag</a></div>
+        </div>
+        <ul><li class="next"><a href="/js/page/2/">Next</a></li></ul>
+    """
+    records = HTMLParser().extract(html, profile["fields"], profile["start_url"])
+    assert records == [
+        {"quote": "First quote", "author": "First Author"},
+        {"quote": "Second quote", "author": "Second Author"},
+    ]
+    assert all(list(record) == ["quote", "author"] for record in records)
+    assert Paginator().get_next_url(
+        html, profile["start_url"], profile["pagination"]["next_button"],
+    ) == "https://quotes.toscrape.com/js/page/2/"
+
+
+def test_quotes_schema_change_cannot_reuse_old_completion(tmp_path):
+    profile = ProfileLoader().load(Path(__file__).resolve().parents[1] / "profiles/quotes_js.yaml")
+    previous_profile = deepcopy(profile)
+    previous_profile["fields"]["author_url"] = "div.quote a::attr(href)"
+    destination = tmp_path / "quotes_javascript.csv"
+    old_key, old_fingerprint = run_identity(previous_profile, destination)
+    new_key, new_fingerprint = run_identity(profile, destination)
+    assert old_key == new_key
+    assert old_fingerprint != new_fingerprint
+
+    cache = URLCache(str(tmp_path / "cache.db"))
+    cache.mark_complete(old_key, old_fingerprint, 3)
+    assert cache.completed_pages(old_key, old_fingerprint) == 3
+    assert cache.completed_pages(new_key, new_fingerprint) is None

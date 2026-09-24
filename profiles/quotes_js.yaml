@@ -13,7 +13,6 @@ delay: 1.0
 fields:
   quote: "div.quote span.text::text"
   author: "div.quote small.author::text"
-  author_url: "div.quote a::attr(href)"
 
 pagination:
   next_button: "li.next a"
