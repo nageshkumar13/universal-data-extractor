@@ -4,6 +4,8 @@ Turn public website listings into CSV, JSON and Excel deliverables using reusabl
 
 **Status:** both engines have been manually verified end to end on Windows with Python 3.12. Hosted GitHub Actions passed on Ubuntu with Python 3.11/3.12 and Windows with Python 3.12. CI installs and launches Chromium against local in-memory HTML; live Books and Quotes scraping was verified manually during the release audit. macOS has not been verified.
 
+Current release: [v1.0.0](https://github.com/nageshkumar13/universal-data-extractor/releases/tag/v1.0.0)
+
 ## Capabilities
 
 - CSS field extraction, relative link resolution and explicit `record_selector` containers, with legacy inference preserved.
@@ -47,6 +49,11 @@ All pages accumulate before transformation and quality processing. The client cl
 ## Installation
 
 Use Python **3.11 or 3.12**, verified by hosted CI on Ubuntu; Windows Python 3.12 also passed hosted CI and was manually verified with real static and browser demonstrations.
+
+```bash
+git clone https://github.com/nageshkumar13/universal-data-extractor.git
+cd universal-data-extractor
+```
 
 From the repository root, create and activate a virtual environment.
 
@@ -225,8 +232,9 @@ The following historical milestone labels are retained unchanged; current behavi
 | v0.7.0 | Automated GitHub Actions test workflow |
 | v0.8.0 | Runner-based orchestration |
 | v0.8.1 | Static framework correctness fixes |
-| Unreleased | Playwright browser engine foundation |
+| v0.8.2 | Portfolio polish and repository hygiene |
+| v1.0.0 | Quality processing, completion caching, explicit record selectors, verified browser extraction, bounded retries, CI and documentation |
 
 ## License
 
-MIT
+[MIT](LICENSE)
